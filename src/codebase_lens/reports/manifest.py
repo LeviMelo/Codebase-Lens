@@ -26,7 +26,23 @@ def utc_run_stamp() -> str:
     return utc_now_iso().replace(":", "-")
 
 
-def prepare_output_layout(repo_root: str | Path, out_dir: str | Path = ".codecontext", *, archive: bool = True) -> OutputLayout:
+def _clear_directory(directory: Path) -> None:
+    if not directory.exists():
+        return
+    for child in directory.iterdir():
+        if child.is_dir():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+
+
+def prepare_output_layout(
+    repo_root: str | Path,
+    out_dir: str | Path = ".codecontext",
+    *,
+    archive: bool = True,
+    clear_latest: bool = True,
+) -> OutputLayout:
     root = Path(repo_root).resolve()
     requested = Path(out_dir)
 
@@ -39,9 +55,17 @@ def prepare_output_layout(repo_root: str | Path, out_dir: str | Path = ".codecon
     latest_dir.mkdir(parents=True, exist_ok=True)
     runs_dir.mkdir(parents=True, exist_ok=True)
 
+    if clear_latest:
+        _clear_directory(latest_dir)
+
     run_dir = None
     if archive:
-        run_dir = runs_dir / utc_run_stamp()
+        base = runs_dir / utc_run_stamp()
+        run_dir = base
+        suffix = 1
+        while run_dir.exists():
+            run_dir = Path(f"{base}-{suffix}")
+            suffix += 1
         run_dir.mkdir(parents=True, exist_ok=False)
 
     return OutputLayout(
@@ -119,6 +143,8 @@ def build_manifest(
             "large_skipped_count": 0,
             "binary_skipped_count": 0,
             "decode_failed_count": 0,
+            "redacted_file_count": 0,
+            "included_count": 0,
         },
         "safety": {
             "redaction_enabled": redaction.get("enabled", True),
@@ -134,8 +160,6 @@ def build_manifest(
 def write_manifest_bundle(layout: OutputLayout, manifest: dict[str, Any]) -> Path:
     manifest_path = layout.latest_dir / "manifest.json"
     write_json(manifest_path, manifest)
-
     if layout.run_dir is not None:
         write_json(layout.run_dir / "manifest.json", manifest)
-
     return manifest_path

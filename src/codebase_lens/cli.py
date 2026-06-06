@@ -6,24 +6,31 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from codebase_lens import __version__
+from codebase_lens.analyzers.excerpts import build_file_excerpt, render_excerpt_markdown
 from codebase_lens.core.constants import (
     DEFAULT_BUDGET,
+    DEFAULT_MAX_EXCERPT_BYTES,
+    DEFAULT_MAX_FILE_BYTES,
     EXIT_GENERAL_ERROR,
     EXIT_INVALID_ARGUMENTS,
     EXIT_OUTPUT_WRITE_FAILURE,
+    EXIT_PATH_SAFETY_VIOLATION,
     EXIT_ROOT_DETECTION_FAILURE,
     PUBLIC_COMMANDS,
 )
-from codebase_lens.core.errors import CblError, OutputWriteError, RootDetectionError
-from codebase_lens.core.paths import detect_repository_root, display_path, gitignore_mentions_codecontext
+from codebase_lens.core.errors import CblError, PathSafetyError, RootDetectionError
+from codebase_lens.core.paths import detect_repository_root, display_path, gitignore_mentions_codecontext, resolve_user_path
 from codebase_lens.core.redaction import redact_console_text
 from codebase_lens.core.result import CblCommandResult, emit_result
 from codebase_lens.git.discover import collect_git_info
-from codebase_lens.reports.manifest import build_manifest, prepare_output_layout, write_manifest_bundle
+from codebase_lens.reports.manifest import build_manifest, copy_latest_to_run, prepare_output_layout, write_manifest_bundle
+from codebase_lens.scanners.inventory import write_file_inventory
+from codebase_lens.scanners.tree import write_tree_report
+from codebase_lens.scanners.universe import discover_file_universe
 
 
 def _add_global_options(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--repo", default=".", help="Repository root override. Defaults to current directory.")
+    parser.add_argument("--repo", default=None, help="Repository root override. Defaults to detected current repository.")
     parser.add_argument("--out", default=".codecontext", help="Output directory. Defaults to .codecontext.")
     parser.add_argument("--format", choices=("markdown", "json", "both"), default="both")
     parser.add_argument("--budget", type=int, default=DEFAULT_BUDGET)
@@ -31,6 +38,7 @@ def _add_global_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-archive", action="store_true")
     parser.add_argument("--absolute-paths", action="store_true")
     parser.add_argument("--allow-no-root", action="store_true")
+    parser.add_argument("--max-file-bytes", type=int, default=DEFAULT_MAX_FILE_BYTES)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--quiet", action="store_true")
 
@@ -64,7 +72,7 @@ def build_parser() -> argparse.ArgumentParser:
     tree.add_argument("--show-skipped", action="store_true")
     tree.add_argument("--show-sizes", action="store_true")
     tree.add_argument("--changed-only", action="store_true")
-    tree.set_defaults(handler=_run_partial)
+    tree.set_defaults(handler=_run_tree)
 
     symbols = sub.add_parser("symbols", parents=[parent], help="List Python symbols.")
     symbols.add_argument("--kind", choices=("function", "class", "method", "all"), default="all")
@@ -110,7 +118,7 @@ def build_parser() -> argparse.ArgumentParser:
     file_cmd.add_argument("--lines")
     file_cmd.add_argument("--around", type=int)
     file_cmd.add_argument("--context", type=int, default=30)
-    file_cmd.set_defaults(handler=_run_partial)
+    file_cmd.set_defaults(handler=_run_file)
 
     symbol = sub.add_parser("symbol", parents=[parent], help="Emit one or more symbol excerpts.")
     symbol.add_argument("symbol_name")
@@ -155,12 +163,41 @@ def _git_manifest_payload(git_info) -> dict[str, object]:
     }
 
 
+def _detect_root(args: argparse.Namespace):
+    return detect_repository_root(
+        explicit_repo=args.repo,
+        allow_no_root=args.allow_no_root,
+    )
+
+
+def _base_manifest_args(args: argparse.Namespace, repo_root: Path, subcommand: str, outputs: dict[str, str], file_universe=None, redaction=None) -> dict[str, object]:
+    git_info = collect_git_info(repo_root)
+    redaction_payload = redaction or {
+        "enabled": True,
+        "redacted_files_count": 0,
+        "redacted_occurrences_count": 0,
+        "patterns_hit": [],
+    }
+
+    return {
+        "repo_root": repo_root,
+        "repo_name": repo_root.name,
+        "root_redacted_for_ai": True,
+        "is_git_repo": git_info.is_repo,
+        "git": _git_manifest_payload(git_info),
+        "argv": ["cbl", *sys.argv[1:]],
+        "subcommand": subcommand,
+        "budget": args.budget,
+        "focus": list(args.focus),
+        "outputs": outputs,
+        "redaction": redaction_payload,
+        "file_universe": file_universe,
+    }
+
+
 def _run_doctor(args: argparse.Namespace) -> int:
     try:
-        root_info = detect_repository_root(
-            explicit_repo=args.repo,
-            allow_no_root=args.allow_no_root,
-        )
+        root_info = _detect_root(args)
         repo_root = root_info.root
         git_info = collect_git_info(repo_root)
 
@@ -173,26 +210,15 @@ def _run_doctor(args: argparse.Namespace) -> int:
             warnings.append("WARNING: .codecontext/ is not ignored by Git. Add it to .gitignore.")
 
         manifest = build_manifest(
-            repo_root=repo_root,
-            repo_name=repo_root.name,
-            root_redacted_for_ai=True,
-            is_git_repo=git_info.is_repo,
-            git=_git_manifest_payload(git_info),
-            argv=["cbl", *sys.argv[1:]],
-            subcommand="doctor",
-            budget=args.budget,
-            focus=list(args.focus),
-            outputs={
-                "manifest_json": ".codecontext/latest/manifest.json",
-            },
-            redaction={
-                "enabled": True,
-                "redacted_files_count": 0,
-                "redacted_occurrences_count": 0,
-                "patterns_hit": [],
-            },
+            **_base_manifest_args(
+                args,
+                repo_root,
+                "doctor",
+                {"manifest_json": ".codecontext/latest/manifest.json"},
+            )
         )
         manifest_path = write_manifest_bundle(layout, manifest)
+        copy_latest_to_run(layout)
 
     except RootDetectionError as exc:
         print(redact_console_text(f"ERROR: {exc}"))
@@ -218,6 +244,141 @@ def _run_doctor(args: argparse.Namespace) -> int:
             print(f"Archive run: {display_path(repo_root, layout.run_dir, absolute=args.absolute_paths)}")
         for warning in warnings:
             print(redact_console_text(warning))
+
+    return 0
+
+
+def _run_tree(args: argparse.Namespace) -> int:
+    try:
+        root_info = _detect_root(args)
+        repo_root = root_info.root
+        universe = discover_file_universe(repo_root, max_file_bytes=args.max_file_bytes)
+
+        layout = prepare_output_layout(repo_root, args.out, archive=not args.no_archive)
+
+        inventory_path = write_file_inventory(layout, universe)
+        tree_path = write_tree_report(
+            layout,
+            universe,
+            max_depth=args.depth,
+            show_sizes=args.show_sizes,
+            show_skipped=args.show_skipped,
+        )
+
+        manifest = build_manifest(
+            **_base_manifest_args(
+                args,
+                repo_root,
+                "tree",
+                {
+                    "manifest_json": ".codecontext/latest/manifest.json",
+                    "file_inventory_json": ".codecontext/latest/file_inventory.json",
+                    "repo_tree_txt": ".codecontext/latest/repo_tree.txt",
+                },
+                file_universe=universe.manifest_counts(),
+                redaction={
+                    "enabled": True,
+                    "redacted_files_count": universe.counts.get("redacted_file_count", 0),
+                    "redacted_occurrences_count": universe.redaction.redacted_occurrences_count,
+                    "patterns_hit": list(universe.redaction.patterns_hit),
+                },
+            )
+        )
+        manifest_path = write_manifest_bundle(layout, manifest)
+        copy_latest_to_run(layout)
+
+    except RootDetectionError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_ROOT_DETECTION_FAILURE
+    except OSError as exc:
+        print(redact_console_text(f"ERROR: Could not write tree report: {exc}"))
+        return EXIT_OUTPUT_WRITE_FAILURE
+    except CblError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_GENERAL_ERROR
+
+    if not args.quiet:
+        print("CBL tree: OK")
+        print(f"Repository: {repo_root.name}")
+        print(f"Included files: {universe.counts.get('included_count', 0)}")
+        print(f"Tracked included: {universe.counts.get('tracked_included_count', 0)}")
+        print(f"Untracked included: {universe.counts.get('untracked_included_count', 0)}")
+        print(f"Ignored count: {universe.counts.get('ignored_count', 0)}")
+        print(f"Hard-excluded count: {universe.counts.get('hard_excluded_count', 0)}")
+        print(f"Tree report: {display_path(repo_root, tree_path, absolute=args.absolute_paths)}")
+        print(f"File inventory: {display_path(repo_root, inventory_path, absolute=args.absolute_paths)}")
+        print(f"Output manifest: {display_path(repo_root, manifest_path, absolute=args.absolute_paths)}")
+        for warning in universe.warnings:
+            print(redact_console_text(f"WARNING: {warning}"))
+
+    return 0
+
+
+def _run_file(args: argparse.Namespace) -> int:
+    try:
+        root_info = _detect_root(args)
+        repo_root = root_info.root
+        target = resolve_user_path(
+            repo_root,
+            args.path,
+            allow_absolute=False,
+            allow_hard_excluded=False,
+        )
+
+        excerpt = build_file_excerpt(
+            repo_root,
+            target,
+            line_selector=args.lines,
+            around=args.around,
+            context=args.context,
+            max_file_bytes=min(args.max_file_bytes, DEFAULT_MAX_EXCERPT_BYTES),
+        )
+
+        layout = prepare_output_layout(repo_root, args.out, archive=not args.no_archive)
+        excerpt_path = layout.latest_dir / "file_excerpt.md"
+        excerpt_markdown = render_excerpt_markdown(excerpt)
+        excerpt_path.write_text(excerpt_markdown + "\n", encoding="utf-8", newline="\n")
+
+        manifest = build_manifest(
+            **_base_manifest_args(
+                args,
+                repo_root,
+                "file",
+                {
+                    "manifest_json": ".codecontext/latest/manifest.json",
+                    "file_excerpt_md": ".codecontext/latest/file_excerpt.md",
+                },
+                redaction={
+                    "enabled": True,
+                    "redacted_files_count": 1 if excerpt.redaction.redacted_occurrences_count else 0,
+                    "redacted_occurrences_count": excerpt.redaction.redacted_occurrences_count,
+                    "patterns_hit": list(excerpt.redaction.patterns_hit),
+                },
+            )
+        )
+        manifest_path = write_manifest_bundle(layout, manifest)
+        copy_latest_to_run(layout)
+
+    except RootDetectionError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_ROOT_DETECTION_FAILURE
+    except PathSafetyError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_PATH_SAFETY_VIOLATION
+    except ValueError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_INVALID_ARGUMENTS
+    except OSError as exc:
+        print(redact_console_text(f"ERROR: Could not read or write file excerpt: {exc}"))
+        return EXIT_OUTPUT_WRITE_FAILURE
+    except CblError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_GENERAL_ERROR
+
+    if not args.quiet:
+        print(excerpt_markdown)
+        print(f"Excerpt report: {display_path(repo_root, excerpt_path, absolute=args.absolute_paths)}")
+        print(f"Output manifest: {display_path(repo_root, manifest_path, absolute=args.absolute_paths)}")
 
     return 0
 
