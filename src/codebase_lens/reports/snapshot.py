@@ -22,6 +22,8 @@ from codebase_lens.reports.json import (
 )
 from codebase_lens.reports.manifest import OutputLayout
 from codebase_lens.analyzers.symbol_graph import collect_symbol_graph
+from codebase_lens.analyzers.evidence_graph import build_evidence_graph
+from codebase_lens.reports.graph import write_evidence_graph_reports
 from codebase_lens.reports.symbol_graph import write_symbol_graph_reports
 from codebase_lens.reports.scanner_outputs import write_file_inventory, write_tree_report
 from codebase_lens.scanners.universe import discover_file_universe
@@ -227,16 +229,21 @@ def write_snapshot_bundle(
 
     changed_file_count = 0
     changed_symbol_count = 0
+    changed_files_for_graph = ()
+    changed_symbols_for_graph = ()
 
     if changed_only:
         diff_result = collect_changed_files(root, include_untracked=True)
         warnings.extend(diff_result.warnings)
+
+        changed_files_for_graph = diff_result.changed_files
 
         changed_payload = changed_files_payload(diff_result)
         write_json_report(layout.latest_dir / "changed_files.json", changed_payload)
         outputs["changed_files_json"] = ".codecontext/latest/changed_files.json"
 
         symbol_result = map_changed_symbols(root, diff_result.changed_files)
+        changed_symbols_for_graph = symbol_result.changed_symbols
         changed_symbols_payload = changed_symbol_result_payload(symbol_result)
         write_json_report(layout.latest_dir / "changed_symbols.json", changed_symbols_payload)
         outputs["changed_symbols_json"] = ".codecontext/latest/changed_symbols.json"
@@ -337,6 +344,20 @@ def write_snapshot_bundle(
     warnings.extend(graph_result.warnings)
     outputs.update(write_symbol_graph_reports(layout, graph_result))
 
+    evidence_graph = build_evidence_graph(
+        root,
+        universe=universe,
+        symbol_graph=graph_result,
+        import_records=imports,
+        command_records=commands,
+        route_records=routes,
+        test_inventory=test_inventory,
+        changed_files=changed_files_for_graph,
+        changed_symbols=changed_symbols_for_graph,
+    )
+    warnings.extend(evidence_graph.warnings)
+    outputs.update(write_evidence_graph_reports(layout, evidence_graph))
+
     counts = {
         "included_files": universe.counts.get("included_count", 0),
         "python_files_analyzed": len(python_files),
@@ -353,6 +374,9 @@ def write_snapshot_bundle(
         "symbol_graph_nodes": graph_result.counts.get("nodes", 0),
         "symbol_graph_call_edges": graph_result.counts.get("call_edges", 0),
         "symbol_graph_caller_edges": graph_result.counts.get("caller_edges", 0),
+        "evidence_graph_nodes": evidence_graph.counts.get("nodes", 0),
+        "evidence_graph_edges": evidence_graph.counts.get("edges", 0),
+        "evidence_graph_unresolved_edges": evidence_graph.counts.get("unresolved_edges", 0),
     }
 
     _write_snapshot_index(

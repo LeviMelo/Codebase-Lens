@@ -90,6 +90,10 @@ def main() -> int:
         "budget_report.json",
     "symbol_graph.json",
     "symbol_graph.md",
+    "evidence_graph.json",
+    "graph_summary.md",
+    "call_graph.json",
+    "module_graph.json",
         "manifest.json",
     }
     existing = {item.name for item in latest.iterdir()}

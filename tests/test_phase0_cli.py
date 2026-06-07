@@ -27,7 +27,8 @@ def run_cbl(*args: str) -> subprocess.CompletedProcess[str]:
 def test_top_level_help_renders_command_surface() -> None:
     result = run_cbl("--help")
     assert result.returncode == 0
-    for command in ("doctor", "pack", "contract", "changed", "callers"):
+    for command in ("doctor", "pack",
+    "graph", "contract", "changed", "callers"):
         assert command in result.stdout
 
 

@@ -70,7 +70,14 @@ def builtin_cbl_contract() -> dict[str, Any]:
             "src/codebase_lens/reports/handoff.py",
             "scripts/dev/audits/audit_v01_readiness.py",
             "src/codebase_lens/contracts/architecture.py",
-        ],
+                    "src/codebase_lens/core/graph.py",
+            "src/codebase_lens/analyzers/evidence_graph.py",
+            "src/codebase_lens/reports/graph.py",
+            "scripts/dev/audits/audit_phase11_evidence_graph.py",
+            "src/codebase_lens/analyzers/graph_query.py",
+            "src/codebase_lens/reports/graph_query.py",
+            "scripts/dev/audits/audit_phase12_graph_query.py",
+],
         "required_symbols": [
             {
                 "path": "src/codebase_lens/cli.py",
@@ -81,6 +88,7 @@ def builtin_cbl_contract() -> dict[str, Any]:
                     "_run_snapshot",
                     "_run_pack",
                     "_run_clean",
+                    "_run_graph",
                     "_run_tree",
                     "_run_file",
                     "_run_symbols",
@@ -144,7 +152,45 @@ def builtin_cbl_contract() -> dict[str, Any]:
                     "evaluate_contract",
                 ],
             },
-        ],
+                    {
+                "path": "src/codebase_lens/core/graph.py",
+                "symbols": [
+                    "GraphNode",
+                    "GraphEdge",
+                    "EvidenceGraph",
+                    "evidence_graph_payload",
+                    "graph_slice_payload",
+                ],
+            },
+            {
+                "path": "src/codebase_lens/analyzers/evidence_graph.py",
+                "symbols": [
+                    "build_evidence_graph",
+                ],
+            },
+            {
+                "path": "src/codebase_lens/reports/graph.py",
+                "symbols": [
+                    "write_evidence_graph_reports",
+                    "render_graph_summary",
+                ],
+            },
+            {
+                "path": "src/codebase_lens/analyzers/graph_query.py",
+                "symbols": [
+                    "GraphQueryResult",
+                    "query_evidence_graph_payload",
+                    "graph_query_payload",
+                ],
+            },
+            {
+                "path": "src/codebase_lens/reports/graph_query.py",
+                "symbols": [
+                    "write_graph_query_reports",
+                    "render_graph_query_markdown",
+                ],
+            },
+],
         "forbidden_imports": [
             {
                 "id": "core-no-upward-imports",

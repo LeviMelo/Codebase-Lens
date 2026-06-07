@@ -25,6 +25,7 @@ COMMANDS = [
     "contract",
     "snapshot",
     "pack",
+    "graph",
     "clean",
 ]
 
@@ -45,6 +46,10 @@ SNAPSHOT_REQUIRED = {
     "budget_report.json",
     "symbol_graph.json",
     "symbol_graph.md",
+    "evidence_graph.json",
+    "graph_summary.md",
+    "call_graph.json",
+    "module_graph.json",
     "snapshot_index.json",
     "manifest.json",
 }

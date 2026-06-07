@@ -184,6 +184,14 @@ def build_parser() -> argparse.ArgumentParser:
     clean.add_argument("--keep", type=int, default=10)
     clean.add_argument("--all", action="store_true")
     clean.set_defaults(handler=_run_clean)
+    graph = sub.add_parser("graph", parents=[parent], help="Query scoped evidence graph neighborhoods.")
+    graph.add_argument("--symbol", help="Symbol name or substring to seed the graph query.")
+    graph.add_argument("--path", help="Repository-relative path to seed the graph query.")
+    graph.add_argument("--module", help="Module name or substring to seed the graph query.")
+    graph.add_argument("--depth", type=int, default=1, help="Undirected graph expansion depth from seed nodes.")
+    graph.add_argument("--limit", type=int, default=60, help="Maximum nodes to retain in the markdown-oriented query view.")
+    graph.add_argument("--changed", action="store_true", help="Seed query from changed hunks and changed symbols.")
+    graph.set_defaults(handler=_run_graph)
 
     return parser
 
@@ -914,6 +922,81 @@ def _run_snapshot(args: argparse.Namespace) -> int:
         for warning in result.warnings:
             print(f"WARNING: {redact_console_text(warning)}")
 
+    return 0
+
+
+
+def _run_graph(args: argparse.Namespace) -> int:
+    try:
+        import json
+
+        from codebase_lens.analyzers.graph_query import query_evidence_graph_payload
+        from codebase_lens.reports.graph_query import write_graph_query_reports
+        from codebase_lens.reports.snapshot import write_snapshot_bundle
+
+        root_info = _detect_root(args)
+        repo_root = root_info.root
+        layout = prepare_output_layout(repo_root, args.out, archive=not args.no_archive)
+
+        snapshot_result = write_snapshot_bundle(
+            layout,
+            repo_root,
+            max_file_bytes=args.max_file_bytes,
+            changed_only=args.changed,
+            budget=args.budget,
+            focus_terms=tuple(args.focus),
+        )
+
+        graph_payload = json.loads((layout.latest_dir / "evidence_graph.json").read_text(encoding="utf-8"))
+
+        query_result = query_evidence_graph_payload(
+            graph_payload,
+            symbol=args.symbol,
+            path=args.path,
+            module=args.module,
+            changed=args.changed,
+            depth=args.depth,
+            limit=args.limit,
+        )
+
+        outputs = dict(snapshot_result.outputs)
+        outputs.update(write_graph_query_reports(layout, query_result))
+
+        manifest = build_manifest(
+            **_base_manifest_args(
+                args,
+                repo_root,
+                "graph",
+                outputs,
+            )
+        )
+        write_manifest_bundle(layout, manifest)
+
+        if not args.no_archive:
+            copy_latest_to_run(layout)
+
+    except RootDetectionError as exc:
+        print(redact_console_text(f"CBL graph: ERROR: {exc}"))
+        return EXIT_ROOT_DETECTION_FAILURE
+    except PathSafetyError as exc:
+        print(redact_console_text(f"CBL graph: ERROR: {exc}"))
+        return EXIT_PATH_SAFETY_VIOLATION
+    except ValueError as exc:
+        print(redact_console_text(f"CBL graph: ERROR: {exc}"))
+        return EXIT_INVALID_ARGUMENTS
+    except OSError as exc:
+        print(redact_console_text(f"CBL graph: ERROR: {exc}"))
+        return EXIT_OUTPUT_WRITE_FAILURE
+    except Exception as exc:
+        print(redact_console_text(f"CBL graph: ERROR: {type(exc).__name__}: {exc}"))
+        return EXIT_GENERAL_ERROR
+
+    print(redact_console_text("CBL graph: OK"))
+    print(redact_console_text(f"Selected nodes: {query_result.counts['nodes']}"))
+    print(redact_console_text(f"Selected edges: {query_result.counts['edges']}"))
+    print(redact_console_text(f"Graph query: {display_path(repo_root, layout.latest_dir / 'graph_query.md')}"))
+    print(redact_console_text(f"Graph query JSON: {display_path(repo_root, layout.latest_dir / 'graph_query.json')}"))
+    print(redact_console_text(f"Evidence graph: {display_path(repo_root, layout.latest_dir / 'evidence_graph.json')}"))
     return 0
 
 

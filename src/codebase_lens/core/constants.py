@@ -27,6 +27,7 @@ PUBLIC_COMMANDS = (
     "contract",
     "pack",
     "clean",
+    "graph",
 )
 
 EXIT_SUCCESS = 0
