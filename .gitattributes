@@ -1,0 +1,19 @@
+# CBL repository text normalization policy.
+# Keep source and generated design/test files stable across Windows and Unix checkouts.
+
+* text=auto
+
+*.py text eol=lf
+*.pyi text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.txt text eol=lf
+*.gitattributes text eol=lf
+*.gitignore text eol=lf
+
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf

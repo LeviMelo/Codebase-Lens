@@ -62,6 +62,7 @@ def builtin_cbl_contract() -> dict[str, Any]:
             "src/codebase_lens/reports/manifest.py",
             "src/codebase_lens/reports/json.py",
             "src/codebase_lens/reports/scanner_outputs.py",
+            "src/codebase_lens/reports/cleanup.py",
             "src/codebase_lens/reports/snapshot.py",
             "src/codebase_lens/reports/handoff.py",
             "src/codebase_lens/contracts/architecture.py",
@@ -75,6 +76,7 @@ def builtin_cbl_contract() -> dict[str, Any]:
                     "_run_doctor",
                     "_run_snapshot",
                     "_run_pack",
+                    "_run_clean",
                     "_run_tree",
                     "_run_file",
                     "_run_symbols",
@@ -86,6 +88,16 @@ def builtin_cbl_contract() -> dict[str, Any]:
                     "_run_tests_inventory",
                     "_run_callers",
                     "_run_contract",
+                ],
+            },
+            {
+                "path": "src/codebase_lens/reports/cleanup.py",
+                "symbols": [
+                    "CleanedRunRecord",
+                    "CleanResult",
+                    "clean_archives",
+                    "clean_result_payload",
+                    "write_clean_report",
                 ],
             },
             {

@@ -39,11 +39,10 @@ def test_doctor_is_implemented_after_phase1() -> None:
     assert "C:\\Users\\" not in result.stdout
 
 
-def test_partial_commands_remain_explicit() -> None:
-    result = run_cbl("clean")
-    assert result.returncode == 1
-    assert "CBL command: clean" in result.stdout
-    assert PARTIAL_IMPLEMENTATION_MESSAGE in result.stdout
+def test_clean_command_is_implemented() -> None:
+    result = run_cbl("clean", "--keep", "999")
+    assert result.returncode == 0
+    assert "CBL clean: OK" in result.stdout
 
 
 def test_all_public_commands_have_help() -> None:

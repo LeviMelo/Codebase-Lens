@@ -55,6 +55,7 @@ from codebase_lens.reports.json import (
     write_json_report,
 )
 from codebase_lens.reports.handoff import write_handoff_pack
+from codebase_lens.reports.cleanup import clean_archives, write_clean_report
 from codebase_lens.reports.manifest import build_manifest, copy_latest_to_run, prepare_output_layout, write_manifest_bundle
 from codebase_lens.reports.snapshot import write_snapshot_bundle
 from codebase_lens.reports.scanner_outputs import write_file_inventory, write_tree_report
@@ -182,7 +183,7 @@ def build_parser() -> argparse.ArgumentParser:
     clean = sub.add_parser("clean", parents=[parent], help="Remove old .codecontext/runs archives.")
     clean.add_argument("--keep", type=int, default=10)
     clean.add_argument("--all", action="store_true")
-    clean.set_defaults(handler=_run_partial)
+    clean.set_defaults(handler=_run_clean)
 
     return parser
 
@@ -1274,6 +1275,65 @@ def _run_changed(args: argparse.Namespace) -> int:
             print(f"WARNING: {redact_console_text(warning)}")
 
     return 0
+
+
+
+def _run_clean(args: argparse.Namespace) -> int:
+    try:
+        root_info = _detect_root(args)
+        repo_root = root_info.root
+
+        result = clean_archives(
+            repo_root,
+            out_dir=args.out,
+            keep=args.keep,
+            remove_all=args.all,
+        )
+
+        layout = prepare_output_layout(repo_root, args.out, archive=False)
+        clean_path = write_clean_report(layout, result)
+
+        manifest = build_manifest(
+            **_base_manifest_args(
+                args,
+                repo_root,
+                "clean",
+                {
+                    "manifest_json": ".codecontext/latest/manifest.json",
+                    "clean_report_json": ".codecontext/latest/clean_report.json",
+                },
+            )
+        )
+        manifest_path = write_manifest_bundle(layout, manifest)
+
+    except RootDetectionError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_ROOT_DETECTION_FAILURE
+    except PathSafetyError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_PATH_SAFETY_VIOLATION
+    except ValueError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_INVALID_ARGUMENTS
+    except OSError as exc:
+        print(redact_console_text(f"ERROR: Could not clean archive runs: {exc}"))
+        return EXIT_OUTPUT_WRITE_FAILURE
+    except CblError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_GENERAL_ERROR
+
+    if not args.quiet:
+        print("CBL clean: OK")
+        print(f"Runs seen: {result.counts['runs_seen']}")
+        print(f"Deleted: {result.counts['deleted']}")
+        print(f"Kept: {result.counts['kept']}")
+        print(f"Errors: {result.counts['errors']}")
+        print(f"Clean report: {display_path(repo_root, clean_path, absolute=args.absolute_paths)}")
+        print(f"Output manifest: {display_path(repo_root, manifest_path, absolute=args.absolute_paths)}")
+        for error in result.errors:
+            print(f"WARNING: {error.path}: {redact_console_text(error.reason)}")
+
+    return 0 if result.counts["errors"] == 0 else EXIT_GENERAL_ERROR
 
 
 def _run_partial(args: argparse.Namespace) -> int:
