@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from codebase_lens.core.models import CommandRecord, ImportRecord, RouteRecord, SymbolRecord
+from codebase_lens.git.diff import ChangedFileSet
 from codebase_lens.reports.manifest import write_json
 
 
@@ -65,4 +66,12 @@ def route_records_payload(records: tuple[RouteRecord, ...], *, syntax_errors: li
             "flask": sum(1 for record in records if record.framework == "flask"),
             "unknown": sum(1 for record in records if record.framework == "unknown"),
         },
+    }
+
+
+def changed_files_payload(result: ChangedFileSet) -> dict[str, Any]:
+    return {
+        "changed_files": [asdict(record) for record in result.changed_files],
+        "counts": dict(result.counts),
+        "warnings": list(result.warnings),
     }
