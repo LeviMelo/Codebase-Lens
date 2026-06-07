@@ -24,10 +24,12 @@ from codebase_lens.analyzers.python_ast import (
 )
 from codebase_lens.analyzers.routes_static import collect_routes, flatten_route_results
 from codebase_lens.analyzers.tests import collect_test_inventory
+from codebase_lens.contracts.architecture import evaluate_contract, load_contract_spec
 from codebase_lens.core.constants import (
     DEFAULT_BUDGET,
     DEFAULT_MAX_EXCERPT_BYTES,
     DEFAULT_MAX_FILE_BYTES,
+    EXIT_CONTRACT_FAILURE,
     EXIT_GENERAL_ERROR,
     EXIT_INVALID_ARGUMENTS,
     EXIT_OUTPUT_WRITE_FAILURE,
@@ -44,6 +46,7 @@ from codebase_lens.git.discover import collect_git_info
 from codebase_lens.reports.json import (
     caller_records_payload,
     changed_files_payload,
+    contract_result_payload,
     command_records_payload,
     import_records_payload,
     route_records_payload,
@@ -52,8 +55,7 @@ from codebase_lens.reports.json import (
     write_json_report,
 )
 from codebase_lens.reports.manifest import build_manifest, copy_latest_to_run, prepare_output_layout, write_manifest_bundle
-from codebase_lens.scanners.inventory import write_file_inventory
-from codebase_lens.scanners.tree import write_tree_report
+from codebase_lens.reports.scanner_outputs import write_file_inventory, write_tree_report
 from codebase_lens.scanners.universe import discover_file_universe
 
 
@@ -167,7 +169,7 @@ def build_parser() -> argparse.ArgumentParser:
     contract = sub.add_parser("contract", parents=[parent], help="Audit repository against an architecture contract.")
     contract.add_argument("--spec")
     contract.add_argument("--no-fail-exit", action="store_true")
-    contract.set_defaults(handler=_run_partial)
+    contract.set_defaults(handler=_run_contract)
 
     pack = sub.add_parser("pack", parents=[parent], help="Produce an AI handoff pack.")
     pack.add_argument("--changed", action="store_true")
@@ -849,6 +851,65 @@ def _run_routes_static(args: argparse.Namespace) -> int:
 
     return 0
 
+
+
+
+def _run_contract(args: argparse.Namespace) -> int:
+    try:
+        root_info = _detect_root(args)
+        repo_root = root_info.root
+        spec = load_contract_spec(repo_root, args.spec)
+        result = evaluate_contract(repo_root, spec)
+        payload = contract_result_payload(result)
+
+        layout = prepare_output_layout(repo_root, args.out, archive=not args.no_archive)
+        contract_path = write_json_report(layout.latest_dir / "contract_report.json", payload)
+
+        manifest = build_manifest(
+            **_base_manifest_args(
+                args,
+                repo_root,
+                "contract",
+                {
+                    "manifest_json": ".codecontext/latest/manifest.json",
+                    "contract_report_json": ".codecontext/latest/contract_report.json",
+                },
+            )
+        )
+        manifest_path = write_manifest_bundle(layout, manifest)
+        copy_latest_to_run(layout)
+
+    except RootDetectionError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_ROOT_DETECTION_FAILURE
+    except PathSafetyError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_PATH_SAFETY_VIOLATION
+    except ValueError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_INVALID_ARGUMENTS
+    except OSError as exc:
+        print(redact_console_text(f"ERROR: Could not write contract report: {exc}"))
+        return EXIT_OUTPUT_WRITE_FAILURE
+    except CblError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_GENERAL_ERROR
+
+    if not args.quiet:
+        status = "OK" if result.counts["errors"] == 0 else "VIOLATIONS"
+        print(f"CBL contract: {status}")
+        print(f"Contract: {result.name}")
+        print(f"Violations: {result.counts['violations']}")
+        print(f"Errors: {result.counts['errors']}")
+        print(f"Warnings: {result.counts['warnings']}")
+        print(f"Python files checked: {result.counts['python_files_checked']}")
+        print(f"Contract report: {display_path(repo_root, contract_path, absolute=args.absolute_paths)}")
+        print(f"Output manifest: {display_path(repo_root, manifest_path, absolute=args.absolute_paths)}")
+
+    if result.counts["errors"] and not args.no_fail_exit:
+        return EXIT_CONTRACT_FAILURE
+
+    return 0
 
 
 def _run_tests_inventory(args: argparse.Namespace) -> int:

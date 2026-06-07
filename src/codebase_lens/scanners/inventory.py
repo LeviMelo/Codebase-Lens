@@ -1,33 +1,42 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
-from codebase_lens.reports.manifest import OutputLayout, write_json
-from codebase_lens.scanners.universe import FileUniverseResult
+
+def _jsonable(value: Any) -> Any:
+    if is_dataclass(value) and not isinstance(value, type):
+        return asdict(value)
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    return value
 
 
-def file_universe_to_inventory(result: FileUniverseResult) -> dict[str, Any]:
+def file_universe_to_inventory(result) -> dict[str, Any]:
+    """Convert a scanner FileUniverseResult into a serializable inventory payload.
+
+    This module intentionally does not write files and does not import report-layer
+    helpers. Scanner modules own file-universe semantics; report modules own output
+    persistence.
+    """
+
     return {
+        "schema": {
+            "name": "cbl.file_inventory",
+            "version": 1,
+        },
         "repo": {
-            "name": result.repo_root.name,
-            "is_git_repo": result.is_git_repo,
-            "git_available": result.git_available,
+            "root": "<redacted>",
+            "root_redacted_for_ai": True,
         },
-        "counts": dict(result.counts),
-        "redaction": {
-            "enabled": result.redaction.enabled,
-            "redacted_occurrences_count": result.redaction.redacted_occurrences_count,
-            "patterns_hit": list(result.redaction.patterns_hit),
-        },
-        "files": [asdict(record) for record in result.included_files],
-        "omissions": [asdict(record) for record in result.omitted_files],
-        "warnings": list(result.warnings),
+        "counts": dict(getattr(result, "counts", {})),
+        "redaction": _jsonable(getattr(result, "redaction", None)),
+        "files": [_jsonable(record) for record in getattr(result, "included_files", ())],
+        "omissions": [_jsonable(record) for record in getattr(result, "omissions", ())],
+        "warnings": list(getattr(result, "warnings", ())),
     }
-
-
-def write_file_inventory(layout: OutputLayout, result: FileUniverseResult) -> Path:
-    path = layout.latest_dir / "file_inventory.json"
-    write_json(path, file_universe_to_inventory(result))
-    return path

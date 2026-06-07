@@ -1,101 +1,99 @@
 from __future__ import annotations
 
-from pathlib import Path
-
-from codebase_lens.core.models import FileRecord, OmissionRecord
-from codebase_lens.reports.manifest import OutputLayout
-from codebase_lens.scanners.universe import FileUniverseResult
+from pathlib import PurePosixPath
+from typing import Any
 
 
-def _trim_path(path: str, max_depth: int) -> str:
-    parts = [part for part in path.split("/") if part]
-    if max_depth <= 0:
-        return path
-    if len(parts) <= max_depth:
-        return path
-    return "/".join([*parts[:max_depth], "..."])
+def _insert_path(root: dict[str, Any], path: str) -> None:
+    current = root
+    parts = [part for part in PurePosixPath(path).parts if part not in {"", "."}]
+    for index, part in enumerate(parts):
+        is_leaf = index == len(parts) - 1
+        if is_leaf:
+            current.setdefault("__files__", set()).add(part)
+        else:
+            current = current.setdefault(part, {})
 
 
-def _tree_lines_from_paths(paths: list[str]) -> list[str]:
-    lines = ["."]
-    seen: set[str] = set()
+def _render_node(node: dict[str, Any], lines: list[str], *, prefix: str, depth: int, max_depth: int) -> None:
+    if depth >= max_depth:
+        hidden_dirs = [key for key in node.keys() if key != "__files__"]
+        hidden_files = list(node.get("__files__", set()))
+        hidden_count = len(hidden_dirs) + len(hidden_files)
+        if hidden_count:
+            lines.append(f"{prefix}... ({hidden_count} entries hidden by depth limit)")
+        return
 
-    for path in sorted(paths):
-        parts = [part for part in path.split("/") if part]
-        for index, part in enumerate(parts):
-            is_file = index == len(parts) - 1
-            prefix = "  " * (index + 1)
-            current = "/".join(parts[: index + 1])
-            display = part if is_file else f"{part}/"
-            if current in seen:
-                continue
-            seen.add(current)
-            lines.append(f"{prefix}{display}")
+    dir_names = sorted(key for key in node.keys() if key != "__files__")
+    file_names = sorted(node.get("__files__", set()))
 
-    return lines
+    for dirname in dir_names:
+        lines.append(f"{prefix}{dirname}/")
+        child = node[dirname]
+        if isinstance(child, dict):
+            _render_node(child, lines, prefix=prefix + "  ", depth=depth + 1, max_depth=max_depth)
+
+    for filename in file_names:
+        lines.append(f"{prefix}{filename}")
 
 
 def render_tree_report(
-    result: FileUniverseResult,
+    result,
     *,
     max_depth: int = 4,
     show_sizes: bool = False,
     show_skipped: bool = False,
 ) -> str:
-    paths: list[str] = []
-    size_by_path = {record.path: record.size_bytes for record in result.included_files}
+    """Render a scanner FileUniverseResult as text without report-layer imports."""
 
-    for record in result.included_files:
-        rendered = _trim_path(record.path, max_depth)
-        if show_sizes and rendered == record.path:
-            rendered = f"{rendered} ({record.size_bytes} bytes)"
-        paths.append(rendered)
+    included_files = list(getattr(result, "included_files", ()))
+    omissions = list(getattr(result, "omissions", ()))
+    counts = dict(getattr(result, "counts", {}))
 
-    lines = [
-        "CBL Repository Tree",
-        f"Repository: {result.repo_root.name}",
-        f"Git repository: {str(result.is_git_repo).lower()}",
-        f"Included files: {result.counts.get('included_count', 0)}",
-        f"Tracked included: {result.counts.get('tracked_included_count', 0)}",
-        f"Untracked included: {result.counts.get('untracked_included_count', 0)}",
-        f"Ignored count: {result.counts.get('ignored_count', 0)}",
-        f"Hard-excluded count: {result.counts.get('hard_excluded_count', 0)}",
-        f"Large skipped count: {result.counts.get('large_skipped_count', 0)}",
-        f"Binary skipped count: {result.counts.get('binary_skipped_count', 0)}",
-        f"Decode-failed count: {result.counts.get('decode_failed_count', 0)}",
+    tree: dict[str, Any] = {}
+    for record in included_files:
+        path = getattr(record, "path", None)
+        if isinstance(path, str) and path:
+            _insert_path(tree, path)
+
+    lines: list[str] = [
+        "# CBL Repository Tree",
         "",
+        "Evidence scope: scanner file universe",
+        f"Included files: {counts.get('included_count', len(included_files))}",
+        f"Tracked included: {counts.get('tracked_included_count', 0)}",
+        f"Untracked included: {counts.get('untracked_included_count', 0)}",
+        f"Ignored count: {counts.get('ignored_count', 0)}",
+        f"Hard-excluded count: {counts.get('hard_excluded_count', 0)}",
+        f"Binary skipped: {counts.get('binary_skipped_count', 0)}",
+        f"Large skipped: {counts.get('large_skipped_count', 0)}",
+        "",
+        "Tree:",
     ]
 
-    lines.extend(_tree_lines_from_paths(sorted(set(paths))))
+    if not tree:
+        lines.append("(no included files)")
+    else:
+        _render_node(tree, lines, prefix="", depth=0, max_depth=max_depth)
+
+    if show_sizes:
+        lines.extend(["", "File sizes:"])
+        for record in sorted(included_files, key=lambda item: getattr(item, "path", "")):
+            path = getattr(record, "path", "")
+            size = getattr(record, "size_bytes", None)
+            if path:
+                lines.append(f"{path}\t{size if size is not None else 'unknown'} bytes")
 
     if show_skipped:
-        lines.append("")
-        lines.append("Skipped and omitted files:")
-        if not result.omitted_files:
-            lines.append("  <none>")
-        for omission in result.omitted_files:
-            lines.append(f"  {omission.path} [{omission.reason}]")
+        lines.extend(["", "Skipped/omitted files:"])
+        if not omissions:
+            lines.append("(none)")
+        else:
+            for record in omissions:
+                path = getattr(record, "path", "")
+                reason = getattr(record, "reason", "unknown")
+                evidence = getattr(record, "evidence", None)
+                suffix = f" ({evidence})" if evidence else ""
+                lines.append(f"{path}: {reason}{suffix}")
 
-    return "\n".join(lines) + "\n"
-
-
-def write_tree_report(
-    layout: OutputLayout,
-    result: FileUniverseResult,
-    *,
-    max_depth: int = 4,
-    show_sizes: bool = False,
-    show_skipped: bool = False,
-) -> Path:
-    path = layout.latest_dir / "repo_tree.txt"
-    path.write_text(
-        render_tree_report(
-            result,
-            max_depth=max_depth,
-            show_sizes=show_sizes,
-            show_skipped=show_skipped,
-        ),
-        encoding="utf-8",
-        newline="\n",
-    )
-    return path
+    return "\n".join(lines)

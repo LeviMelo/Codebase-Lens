@@ -6,6 +6,7 @@ from typing import Any
 
 from codebase_lens.analyzers.callers import CallerAnalysisResult
 from codebase_lens.analyzers.tests import TestInventoryResult
+from codebase_lens.contracts.architecture import ContractResult
 from codebase_lens.core.models import CommandRecord, ImportRecord, RouteRecord, SymbolRecord
 from codebase_lens.git.diff import ChangedFileSet
 from codebase_lens.reports.manifest import write_json
@@ -104,4 +105,14 @@ def caller_records_payload(result: CallerAnalysisResult) -> dict[str, Any]:
             "total": len(result.callers),
             "files": len({record.path for record in result.callers}),
         },
+    }
+
+
+def contract_result_payload(result: ContractResult) -> dict[str, Any]:
+    return {
+        "contract_id": result.contract_id,
+        "name": result.name,
+        "violations": [asdict(record) for record in result.violations],
+        "warnings": list(result.warnings),
+        "counts": dict(result.counts),
     }
