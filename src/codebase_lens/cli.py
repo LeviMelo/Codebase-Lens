@@ -9,6 +9,7 @@ from pathlib import Path
 
 from codebase_lens import __version__
 from codebase_lens.analyzers.changed_symbols import changed_symbol_result_payload, map_changed_symbols
+from codebase_lens.analyzers.callers import collect_callers
 from codebase_lens.analyzers.cli_static import collect_cli_commands, flatten_cli_results
 from codebase_lens.analyzers.excerpts import build_file_excerpt, render_excerpt_markdown
 from codebase_lens.analyzers.imports import (
@@ -22,6 +23,7 @@ from codebase_lens.analyzers.python_ast import (
     flatten_symbol_results,
 )
 from codebase_lens.analyzers.routes_static import collect_routes, flatten_route_results
+from codebase_lens.analyzers.tests import collect_test_inventory
 from codebase_lens.core.constants import (
     DEFAULT_BUDGET,
     DEFAULT_MAX_EXCERPT_BYTES,
@@ -40,11 +42,13 @@ from codebase_lens.core.result import CblCommandResult, emit_result
 from codebase_lens.git.diff import collect_changed_files
 from codebase_lens.git.discover import collect_git_info
 from codebase_lens.reports.json import (
+    caller_records_payload,
     changed_files_payload,
     command_records_payload,
     import_records_payload,
     route_records_payload,
     symbol_records_payload,
+    test_inventory_payload,
     write_json_report,
 )
 from codebase_lens.reports.manifest import build_manifest, copy_latest_to_run, prepare_output_layout, write_manifest_bundle
@@ -125,7 +129,7 @@ def build_parser() -> argparse.ArgumentParser:
     tests = sub.add_parser("tests", parents=[parent], help="Inventory tests.")
     tests.add_argument("--target")
     tests.add_argument("--show-fixtures", action="store_true")
-    tests.set_defaults(handler=_run_partial)
+    tests.set_defaults(handler=_run_tests_inventory)
 
     diff = sub.add_parser("diff", parents=[parent], help="Summarize Git diffs.")
     diff.add_argument("--staged", action="store_true")
@@ -157,7 +161,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     callers = sub.add_parser("callers", parents=[parent], help="Find static call sites.")
     callers.add_argument("name")
-    callers.set_defaults(handler=_run_partial)
+    callers.add_argument("--path")
+    callers.set_defaults(handler=_run_callers)
 
     contract = sub.add_parser("contract", parents=[parent], help="Audit repository against an architecture contract.")
     contract.add_argument("--spec")
@@ -841,6 +846,127 @@ def _run_routes_static(args: argparse.Namespace) -> int:
             print(f"WARNING: {limitation}")
         if syntax_errors:
             print(f"Syntax errors: {len(syntax_errors)}")
+
+    return 0
+
+
+
+def _run_tests_inventory(args: argparse.Namespace) -> int:
+    try:
+        root_info = _detect_root(args)
+        repo_root = root_info.root
+        python_files, universe = _python_files_for_analysis(args, repo_root)
+
+        inventory = collect_test_inventory(
+            repo_root,
+            python_files,
+            target=args.target,
+            include_fixtures=args.show_fixtures,
+        )
+        payload = test_inventory_payload(inventory)
+
+        layout = prepare_output_layout(repo_root, args.out, archive=not args.no_archive)
+        tests_path = write_json_report(layout.latest_dir / "tests_inventory.json", payload)
+
+        manifest = build_manifest(
+            **_base_manifest_args(
+                args,
+                repo_root,
+                "tests",
+                {
+                    "manifest_json": ".codecontext/latest/manifest.json",
+                    "tests_inventory_json": ".codecontext/latest/tests_inventory.json",
+                },
+                file_universe=universe.manifest_counts() if universe is not None else None,
+            )
+        )
+        manifest_path = write_manifest_bundle(layout, manifest)
+        copy_latest_to_run(layout)
+
+    except RootDetectionError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_ROOT_DETECTION_FAILURE
+    except PathSafetyError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_PATH_SAFETY_VIOLATION
+    except ValueError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_INVALID_ARGUMENTS
+    except OSError as exc:
+        print(redact_console_text(f"ERROR: Could not write test inventory report: {exc}"))
+        return EXIT_OUTPUT_WRITE_FAILURE
+    except CblError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_GENERAL_ERROR
+
+    if not args.quiet:
+        print("CBL tests: OK")
+        print(f"Python files analyzed: {len(python_files)}")
+        print(f"Test files: {payload['counts']['test_files']}")
+        print(f"Test functions: {payload['counts']['test_functions']}")
+        print(f"Test classes: {payload['counts']['test_classes']}")
+        print(f"Fixtures: {payload['counts']['fixtures']}")
+        print(f"Tests inventory: {display_path(repo_root, tests_path, absolute=args.absolute_paths)}")
+        print(f"Output manifest: {display_path(repo_root, manifest_path, absolute=args.absolute_paths)}")
+        if inventory.syntax_errors:
+            print(f"Syntax errors: {len(inventory.syntax_errors)}")
+
+    return 0
+
+
+def _run_callers(args: argparse.Namespace) -> int:
+    try:
+        root_info = _detect_root(args)
+        repo_root = root_info.root
+        python_files, universe = _python_files_for_analysis(args, repo_root)
+
+        result = collect_callers(repo_root, python_files, args.name)
+        payload = caller_records_payload(result)
+
+        layout = prepare_output_layout(repo_root, args.out, archive=not args.no_archive)
+        callers_path = write_json_report(layout.latest_dir / "callers.json", payload)
+
+        manifest = build_manifest(
+            **_base_manifest_args(
+                args,
+                repo_root,
+                "callers",
+                {
+                    "manifest_json": ".codecontext/latest/manifest.json",
+                    "callers_json": ".codecontext/latest/callers.json",
+                },
+                file_universe=universe.manifest_counts() if universe is not None else None,
+            )
+        )
+        manifest_path = write_manifest_bundle(layout, manifest)
+        copy_latest_to_run(layout)
+
+    except RootDetectionError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_ROOT_DETECTION_FAILURE
+    except PathSafetyError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_PATH_SAFETY_VIOLATION
+    except ValueError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_INVALID_ARGUMENTS
+    except OSError as exc:
+        print(redact_console_text(f"ERROR: Could not write caller report: {exc}"))
+        return EXIT_OUTPUT_WRITE_FAILURE
+    except CblError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_GENERAL_ERROR
+
+    if not args.quiet:
+        print("CBL callers: OK")
+        print(f"Python files analyzed: {len(python_files)}")
+        print(f"Query: {args.name}")
+        print(f"Call sites: {payload['counts']['total']}")
+        print(f"Files with call sites: {payload['counts']['files']}")
+        print(f"Callers report: {display_path(repo_root, callers_path, absolute=args.absolute_paths)}")
+        print(f"Output manifest: {display_path(repo_root, manifest_path, absolute=args.absolute_paths)}")
+        if result.syntax_errors:
+            print(f"Syntax errors: {len(result.syntax_errors)}")
 
     return 0
 

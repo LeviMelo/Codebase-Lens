@@ -120,7 +120,7 @@ def build_manifest(
         "generated_at_utc": utc_now_iso(),
         "repo": {
             "name": repo_name,
-            "root": str(repo_root.resolve()),
+            "root": "<redacted>" if root_redacted_for_ai else str(repo_root.resolve()),
             "root_redacted_for_ai": root_redacted_for_ai,
             "is_git_repo": is_git_repo,
             "detected_project_types": ["python"] if (repo_root / "pyproject.toml").exists() else [],

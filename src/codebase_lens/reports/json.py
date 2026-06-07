@@ -4,6 +4,8 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from codebase_lens.analyzers.callers import CallerAnalysisResult
+from codebase_lens.analyzers.tests import TestInventoryResult
 from codebase_lens.core.models import CommandRecord, ImportRecord, RouteRecord, SymbolRecord
 from codebase_lens.git.diff import ChangedFileSet
 from codebase_lens.reports.manifest import write_json
@@ -74,4 +76,32 @@ def changed_files_payload(result: ChangedFileSet) -> dict[str, Any]:
         "changed_files": [asdict(record) for record in result.changed_files],
         "counts": dict(result.counts),
         "warnings": list(result.warnings),
+    }
+
+
+def test_inventory_payload(result: TestInventoryResult) -> dict[str, Any]:
+    return {
+        "tests": [asdict(record) for record in result.tests],
+        "fixtures": [asdict(record) for record in result.fixtures],
+        "syntax_errors": list(result.syntax_errors),
+        "warnings": list(result.warnings),
+        "counts": {
+            "test_files": len(result.tests),
+            "test_functions": sum(len(record.test_functions) for record in result.tests),
+            "test_classes": sum(len(record.test_classes) for record in result.tests),
+            "fixtures": len(result.fixtures),
+        },
+    }
+
+
+def caller_records_payload(result: CallerAnalysisResult) -> dict[str, Any]:
+    return {
+        "query": result.query,
+        "callers": [asdict(record) for record in result.callers],
+        "syntax_errors": list(result.syntax_errors),
+        "warnings": list(result.warnings),
+        "counts": {
+            "total": len(result.callers),
+            "files": len({record.path for record in result.callers}),
+        },
     }
