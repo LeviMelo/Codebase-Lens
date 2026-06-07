@@ -869,6 +869,8 @@ def _run_snapshot(args: argparse.Namespace) -> int:
             repo_root,
             max_file_bytes=args.max_file_bytes,
             changed_only=args.changed,
+            budget=args.budget,
+            focus_terms=tuple(args.focus),
         )
 
         outputs = {
@@ -928,6 +930,8 @@ def _run_pack(args: argparse.Namespace) -> int:
             changed_only=args.changed,
             issue=args.issue,
             spec_path=args.spec,
+            budget=args.budget,
+            focus_terms=tuple(args.focus),
         )
 
         outputs = {

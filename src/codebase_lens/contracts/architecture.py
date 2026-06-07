@@ -65,6 +65,7 @@ def builtin_cbl_contract() -> dict[str, Any]:
             "src/codebase_lens/reports/cleanup.py",
             "src/codebase_lens/reports/snapshot.py",
             "src/codebase_lens/reports/handoff.py",
+            "scripts/dev/audits/audit_v01_readiness.py",
             "src/codebase_lens/contracts/architecture.py",
         ],
         "required_symbols": [

@@ -81,6 +81,13 @@ def main() -> int:
         "routes.json",
         "tests_inventory.json",
         "snapshot_index.json",
+        "symbol_index.json",
+        "import_graph.json",
+        "cli_inventory.json",
+        "route_inventory.json",
+        "test_inventory.json",
+        "omissions.json",
+        "budget_report.json",
         "manifest.json",
     }
     existing = {item.name for item in latest.iterdir()}
@@ -114,6 +121,8 @@ def main() -> int:
         "ai_handoff.md",
         "pack_index.json",
         "snapshot_index.json",
+        "omissions.json",
+        "budget_report.json",
         "manifest.json",
     }
     existing = {item.name for item in latest.iterdir()}

@@ -86,6 +86,41 @@ def _format_changed_symbols(layout: OutputLayout, *, max_items: int = 80) -> lis
     return lines
 
 
+def _format_omissions(layout: OutputLayout, *, max_items: int = 60) -> list[str]:
+    payload = _read_json(layout.latest_dir / "omissions.json")
+    records = payload.get("omissions", [])
+    if not isinstance(records, list) or not records:
+        return ["- No omitted files were reported by the scanner."]
+
+    lines: list[str] = []
+    for record in records[:max_items]:
+        if not isinstance(record, dict):
+            continue
+        path = record.get("path", "<unknown>")
+        reason = record.get("reason", "<unknown>")
+        evidence = record.get("evidence")
+        suffix = f" — {evidence}" if evidence else ""
+        lines.append(f"- `{path}` → {reason}{suffix}")
+
+    if len(records) > max_items:
+        lines.append(f"- ... {len(records) - max_items} additional omissions omitted from markdown; see `omissions.json`.")
+
+    return lines
+
+
+def _format_budget(layout: OutputLayout) -> list[str]:
+    payload = _read_json(layout.latest_dir / "budget_report.json")
+    if not payload:
+        return ["- `budget_report.json` was not generated."]
+
+    return [
+        f"- Requested budget tokens: {payload.get('requested_budget_tokens')}",
+        f"- Budget pressure: {payload.get('budget_pressure')}",
+        f"- Focus terms: {payload.get('focus_terms', [])}",
+        f"- Estimation method: {payload.get('estimation_method')}",
+    ]
+
+
 def _write_pack_index(
     layout: OutputLayout,
     *,
@@ -94,6 +129,8 @@ def _write_pack_index(
     outputs: dict[str, str],
     counts: dict[str, int],
     warnings: tuple[str, ...],
+    budget: int,
+    focus_terms: tuple[str, ...],
 ) -> Path:
     payload = {
         "schema": {
@@ -102,6 +139,8 @@ def _write_pack_index(
         },
         "issue": issue,
         "scope": "changed" if changed_only else "full",
+        "budget": budget,
+        "focus_terms": list(focus_terms),
         "outputs": outputs,
         "counts": counts,
         "warnings": list(warnings),
@@ -117,6 +156,8 @@ def write_handoff_pack(
     changed_only: bool = False,
     issue: str | None = None,
     spec_path: str | Path | None = None,
+    budget: int = 16000,
+    focus_terms: tuple[str, ...] = (),
 ) -> HandoffPackResult:
     root = Path(repo_root).resolve()
 
@@ -126,6 +167,8 @@ def write_handoff_pack(
         max_file_bytes=max_file_bytes,
         changed_only=changed_only,
         tree_depth=5,
+        budget=budget,
+        focus_terms=focus_terms,
     )
 
     outputs = dict(snapshot.outputs)
@@ -144,6 +187,8 @@ def write_handoff_pack(
     output_lines = _format_output_list(outputs)
     changed_files = _format_changed_files(layout)
     changed_symbols = _format_changed_symbols(layout)
+    omissions = _format_omissions(layout)
+    budget_lines = _format_budget(layout)
 
     markdown_lines = [
         "# CBL AI Handoff Pack",
@@ -165,6 +210,11 @@ def write_handoff_pack(
         f"- Fixtures: {counts.get('fixtures', 0)}",
         f"- Changed files: {counts.get('changed_files', 0)}",
         f"- Changed symbols: {counts.get('changed_symbols', 0)}",
+        f"- Omissions: {counts.get('omissions', 0)}",
+        "",
+        "## Budget and Focus",
+        "",
+        *budget_lines,
         "",
         "## Generated Outputs",
         "",
@@ -177,6 +227,10 @@ def write_handoff_pack(
         "## Changed Python Symbols",
         "",
         *changed_symbols,
+        "",
+        "## Omissions",
+        "",
+        *omissions,
         "",
         "## Repository Tree Excerpt",
         "",
@@ -206,6 +260,8 @@ def write_handoff_pack(
         outputs=outputs,
         counts=counts,
         warnings=tuple(warnings),
+        budget=budget,
+        focus_terms=focus_terms,
     )
     outputs["pack_index_json"] = ".codecontext/latest/pack_index.json"
 
