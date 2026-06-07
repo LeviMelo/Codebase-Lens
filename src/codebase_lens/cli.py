@@ -54,7 +54,9 @@ from codebase_lens.reports.json import (
     test_inventory_payload,
     write_json_report,
 )
+from codebase_lens.reports.handoff import write_handoff_pack
 from codebase_lens.reports.manifest import build_manifest, copy_latest_to_run, prepare_output_layout, write_manifest_bundle
+from codebase_lens.reports.snapshot import write_snapshot_bundle
 from codebase_lens.reports.scanner_outputs import write_file_inventory, write_tree_report
 from codebase_lens.scanners.universe import discover_file_universe
 
@@ -95,7 +97,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     snapshot = sub.add_parser("snapshot", parents=[parent], help="Write repository snapshot reports.")
     snapshot.add_argument("--changed", action="store_true")
-    snapshot.set_defaults(handler=_run_partial)
+    snapshot.set_defaults(handler=_run_snapshot)
 
     tree = sub.add_parser("tree", parents=[parent], help="Print or write a compact repository tree.")
     tree.add_argument("--depth", type=int, default=4)
@@ -175,7 +177,7 @@ def build_parser() -> argparse.ArgumentParser:
     pack.add_argument("--changed", action="store_true")
     pack.add_argument("--issue")
     pack.add_argument("--spec")
-    pack.set_defaults(handler=_run_partial)
+    pack.set_defaults(handler=_run_pack)
 
     clean = sub.add_parser("clean", parents=[parent], help="Remove old .codecontext/runs archives.")
     clean.add_argument("--keep", type=int, default=10)
@@ -852,6 +854,128 @@ def _run_routes_static(args: argparse.Namespace) -> int:
     return 0
 
 
+
+
+
+def _run_snapshot(args: argparse.Namespace) -> int:
+    try:
+        root_info = _detect_root(args)
+        repo_root = root_info.root
+        layout = prepare_output_layout(repo_root, args.out, archive=not args.no_archive)
+
+        result = write_snapshot_bundle(
+            layout,
+            repo_root,
+            max_file_bytes=args.max_file_bytes,
+            changed_only=args.changed,
+        )
+
+        outputs = {
+            "manifest_json": ".codecontext/latest/manifest.json",
+            **result.outputs,
+        }
+
+        manifest = build_manifest(
+            **_base_manifest_args(
+                args,
+                repo_root,
+                "snapshot",
+                outputs,
+            )
+        )
+        manifest_path = write_manifest_bundle(layout, manifest)
+        copy_latest_to_run(layout)
+
+    except RootDetectionError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_ROOT_DETECTION_FAILURE
+    except OSError as exc:
+        print(redact_console_text(f"ERROR: Could not write snapshot bundle: {exc}"))
+        return EXIT_OUTPUT_WRITE_FAILURE
+    except CblError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_GENERAL_ERROR
+
+    if not args.quiet:
+        print("CBL snapshot: OK")
+        print(f"Scope: {'changed' if args.changed else 'full'}")
+        print(f"Included files: {result.counts.get('included_files', 0)}")
+        print(f"Python files analyzed: {result.counts.get('python_files_analyzed', 0)}")
+        print(f"Symbols: {result.counts.get('symbols', 0)}")
+        print(f"Imports: {result.counts.get('imports', 0)}")
+        print(f"Commands: {result.counts.get('commands', 0)}")
+        print(f"Routes: {result.counts.get('routes', 0)}")
+        print(f"Test functions: {result.counts.get('test_functions', 0)}")
+        print("Snapshot index: .codecontext/latest/snapshot_index.json")
+        print(f"Output manifest: {display_path(repo_root, manifest_path, absolute=args.absolute_paths)}")
+        for warning in result.warnings:
+            print(f"WARNING: {redact_console_text(warning)}")
+
+    return 0
+
+
+def _run_pack(args: argparse.Namespace) -> int:
+    try:
+        root_info = _detect_root(args)
+        repo_root = root_info.root
+        layout = prepare_output_layout(repo_root, args.out, archive=not args.no_archive)
+
+        result = write_handoff_pack(
+            layout,
+            repo_root,
+            max_file_bytes=args.max_file_bytes,
+            changed_only=args.changed,
+            issue=args.issue,
+            spec_path=args.spec,
+        )
+
+        outputs = {
+            "manifest_json": ".codecontext/latest/manifest.json",
+            **result.outputs,
+        }
+
+        manifest = build_manifest(
+            **_base_manifest_args(
+                args,
+                repo_root,
+                "pack",
+                outputs,
+            )
+        )
+        manifest_path = write_manifest_bundle(layout, manifest)
+        copy_latest_to_run(layout)
+
+    except RootDetectionError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_ROOT_DETECTION_FAILURE
+    except PathSafetyError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_PATH_SAFETY_VIOLATION
+    except ValueError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_INVALID_ARGUMENTS
+    except OSError as exc:
+        print(redact_console_text(f"ERROR: Could not write handoff pack: {exc}"))
+        return EXIT_OUTPUT_WRITE_FAILURE
+    except CblError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_GENERAL_ERROR
+
+    if not args.quiet:
+        print("CBL pack: OK")
+        print(f"Scope: {'changed' if args.changed else 'full'}")
+        print(f"Issue/context: {args.issue if args.issue else '(none provided)'}")
+        print(f"Included files: {result.counts.get('included_files', 0)}")
+        print(f"Python files analyzed: {result.counts.get('python_files_analyzed', 0)}")
+        print(f"Changed files: {result.counts.get('changed_files', 0)}")
+        print(f"Changed symbols: {result.counts.get('changed_symbols', 0)}")
+        print("AI handoff: .codecontext/latest/ai_handoff.md")
+        print("Pack index: .codecontext/latest/pack_index.json")
+        print(f"Output manifest: {display_path(repo_root, manifest_path, absolute=args.absolute_paths)}")
+        for warning in result.warnings:
+            print(f"WARNING: {redact_console_text(warning)}")
+
+    return 0
 
 
 def _run_contract(args: argparse.Namespace) -> int:

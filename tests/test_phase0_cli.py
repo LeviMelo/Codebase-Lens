@@ -40,9 +40,9 @@ def test_doctor_is_implemented_after_phase1() -> None:
 
 
 def test_partial_commands_remain_explicit() -> None:
-    result = run_cbl("pack")
+    result = run_cbl("clean")
     assert result.returncode == 1
-    assert "CBL command: pack" in result.stdout
+    assert "CBL command: clean" in result.stdout
     assert PARTIAL_IMPLEMENTATION_MESSAGE in result.stdout
 
 

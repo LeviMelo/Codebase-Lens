@@ -62,6 +62,8 @@ def builtin_cbl_contract() -> dict[str, Any]:
             "src/codebase_lens/reports/manifest.py",
             "src/codebase_lens/reports/json.py",
             "src/codebase_lens/reports/scanner_outputs.py",
+            "src/codebase_lens/reports/snapshot.py",
+            "src/codebase_lens/reports/handoff.py",
             "src/codebase_lens/contracts/architecture.py",
         ],
         "required_symbols": [
@@ -71,6 +73,8 @@ def builtin_cbl_contract() -> dict[str, Any]:
                     "build_parser",
                     "main",
                     "_run_doctor",
+                    "_run_snapshot",
+                    "_run_pack",
                     "_run_tree",
                     "_run_file",
                     "_run_symbols",
@@ -82,6 +86,20 @@ def builtin_cbl_contract() -> dict[str, Any]:
                     "_run_tests_inventory",
                     "_run_callers",
                     "_run_contract",
+                ],
+            },
+            {
+                "path": "src/codebase_lens/reports/snapshot.py",
+                "symbols": [
+                    "SnapshotBundleResult",
+                    "write_snapshot_bundle",
+                ],
+            },
+            {
+                "path": "src/codebase_lens/reports/handoff.py",
+                "symbols": [
+                    "HandoffPackResult",
+                    "write_handoff_pack",
                 ],
             },
             {
