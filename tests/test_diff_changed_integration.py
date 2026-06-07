@@ -105,6 +105,9 @@ def test_diff_and_changed_commands_integrate_git_hunks_symbols_reports_and_manif
     assert "module.py" in changed_paths
     assert "new_module.py" in changed_paths
     assert diff_payload["counts"]["changed_files_count"] >= 2
+    assert diff_payload["counts"]["staged_count"] == 0
+    assert diff_payload["counts"]["unstaged_count"] >= 1
+    assert diff_payload["counts"]["untracked_count"] >= 1
     assert diff_payload["changed_symbols"]["counts"]["total"] >= 2
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -126,6 +129,9 @@ def test_diff_and_changed_commands_integrate_git_hunks_symbols_reports_and_manif
     changed_symbols = json.loads(changed_symbols_path.read_text(encoding="utf-8"))
 
     assert {"module.py", "new_module.py"} <= {record["path"] for record in changed_files["changed_files"]}
+    assert changed_files["counts"]["staged_count"] == 0
+    assert changed_files["counts"]["unstaged_count"] >= 1
+    assert changed_files["counts"]["untracked_count"] >= 1
 
     symbol_names = {record["qualified_name"] for record in changed_symbols["changed_symbols"]}
     assert "alpha" in symbol_names

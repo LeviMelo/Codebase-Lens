@@ -186,11 +186,9 @@ def _collect_untracked(repo_root: Path) -> list[ChangedFile]:
         read_result = read_text_with_policy(target)
         is_binary = read_result.is_binary or read_result.skipped_reason == "binary_skipped"
 
-        additions: int | None
-        hunks: tuple[ChangedHunk, ...]
         if read_result.text is not None:
             line_count = max(1, len(read_result.text.splitlines()))
-            additions = line_count
+            additions: int | None = line_count
             hunks = (
                 ChangedHunk(
                     path=path,
@@ -248,6 +246,19 @@ def _merge_changed_files(files: list[ChangedFile]) -> tuple[ChangedFile, ...]:
     return tuple(sorted(merged.values(), key=lambda record: record.path))
 
 
+def _origin_tokens(origin: str) -> set[str]:
+    tokens: set[str] = set()
+    for part in origin.split("+"):
+        tokens.add(part)
+        if part.startswith("base:"):
+            tokens.add("base")
+    return tokens
+
+
+def _has_origin(item: ChangedFile, origin: str) -> bool:
+    return origin in _origin_tokens(item.origin)
+
+
 def _counts(files: tuple[ChangedFile, ...]) -> dict[str, int]:
     return {
         "changed_files_count": len(files),
@@ -256,9 +267,10 @@ def _counts(files: tuple[ChangedFile, ...]) -> dict[str, int]:
         "deleted_count": sum(1 for item in files if item.status == "D"),
         "renamed_count": sum(1 for item in files if item.status == "R"),
         "binary_count": sum(1 for item in files if item.is_binary),
-        "staged_count": sum(1 for item in files if "staged" in item.origin),
-        "unstaged_count": sum(1 for item in files if "unstaged" in item.origin),
-        "untracked_count": sum(1 for item in files if "untracked" in item.origin),
+        "staged_count": sum(1 for item in files if _has_origin(item, "staged")),
+        "unstaged_count": sum(1 for item in files if _has_origin(item, "unstaged")),
+        "untracked_count": sum(1 for item in files if _has_origin(item, "untracked")),
+        "base_count": sum(1 for item in files if _has_origin(item, "base")),
         "hunk_count": sum(len(item.hunks) for item in files),
     }
 

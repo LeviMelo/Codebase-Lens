@@ -122,6 +122,16 @@ def make_changed_repo(base: Path) -> Path:
     return repo
 
 
+def assert_counts_are_not_substring_based(payload: dict[str, object], context: str) -> None:
+    counts = payload["counts"]
+    if counts["staged_count"] != 0:
+        fail(f"{context}: staged_count should be 0 for purely unstaged/untracked fixture.")
+    if counts["unstaged_count"] < 1:
+        fail(f"{context}: unstaged_count should be at least 1.")
+    if counts["untracked_count"] < 1:
+        fail(f"{context}: untracked_count should be at least 1.")
+
+
 def main() -> int:
     for relative_path, symbols in REQUIRED_SYMBOLS.items():
         path = ROOT / relative_path
@@ -157,6 +167,7 @@ def main() -> int:
             fail(f"diff.json missing expected changed paths: {sorted({'module.py', 'new_module.py'} - changed_paths)}")
         if diff_payload["counts"]["changed_files_count"] < 2:
             fail("diff.json changed file count is invalid.")
+        assert_counts_are_not_substring_based(diff_payload, "diff.json")
         if diff_payload.get("changed_symbols", {}).get("counts", {}).get("total", 0) < 2:
             fail("diff --symbols did not include expected changed symbols.")
 
@@ -184,6 +195,8 @@ def main() -> int:
 
         changed_files = json.loads(changed_files_path.read_text(encoding="utf-8"))
         changed_symbols = json.loads(changed_symbols_path.read_text(encoding="utf-8"))
+
+        assert_counts_are_not_substring_based(changed_files, "changed_files.json")
 
         changed_file_paths = {record["path"] for record in changed_files["changed_files"]}
         if not {"module.py", "new_module.py"} <= changed_file_paths:
