@@ -43,6 +43,8 @@ SNAPSHOT_REQUIRED = {
     "test_inventory.json",
     "omissions.json",
     "budget_report.json",
+    "symbol_graph.json",
+    "symbol_graph.md",
     "snapshot_index.json",
     "manifest.json",
 }

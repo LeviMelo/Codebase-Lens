@@ -121,6 +121,41 @@ def _format_budget(layout: OutputLayout) -> list[str]:
     ]
 
 
+
+def _read_symbol_graph_excerpt(layout: OutputLayout, *, max_lines: int = 140) -> list[str]:
+    path = layout.latest_dir / "symbol_graph.md"
+    if not path.is_file():
+        return ["`symbol_graph.md` was not generated."]
+
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    if len(lines) <= max_lines:
+        return lines
+    return [*lines[:max_lines], f"... ({len(lines) - max_lines} additional symbol-graph lines omitted; see `symbol_graph.md` and `symbol_graph.json`.)"]
+
+
+def _changed_scope_notice(layout: OutputLayout, *, changed_only: bool) -> list[str]:
+    if not changed_only:
+        return []
+
+    payload = _read_json(layout.latest_dir / "changed_files.json")
+    records = payload.get("changed_files", [])
+    if isinstance(records, list) and records:
+        return []
+
+    return [
+        "No Git changes detected for this changed-only pack.",
+        "",
+        "This means changed-file and changed-symbol sections are intentionally empty.",
+        "",
+        "Suggested commands:",
+        "",
+        "- `cbl pack --budget 16000`",
+        "- `cbl snapshot --budget 16000`",
+        "- `cbl symbols`",
+        "- `cbl callers --name <symbol>`",
+    ]
+
+
 def _write_pack_index(
     layout: OutputLayout,
     *,
@@ -189,6 +224,8 @@ def write_handoff_pack(
     changed_symbols = _format_changed_symbols(layout)
     omissions = _format_omissions(layout)
     budget_lines = _format_budget(layout)
+    symbol_graph_excerpt = _read_symbol_graph_excerpt(layout)
+    changed_scope_notice = _changed_scope_notice(layout, changed_only=changed_only)
 
     markdown_lines = [
         "# CBL AI Handoff Pack",
@@ -215,6 +252,16 @@ def write_handoff_pack(
         "## Budget and Focus",
         "",
         *budget_lines,
+        "",
+        "## Changed-Only Scope Notice",
+        "",
+        *(changed_scope_notice or ["No changed-only scope warning applies."]),
+        "",
+        "## Symbol Relationship Graph",
+        "",
+        "Function I/O and static calls are summarized below. Full machine-readable graph: `symbol_graph.json`. Full readable graph: `symbol_graph.md`.",
+        "",
+        *symbol_graph_excerpt,
         "",
         "## Generated Outputs",
         "",

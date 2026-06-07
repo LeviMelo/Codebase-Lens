@@ -21,6 +21,8 @@ from codebase_lens.reports.json import (
     write_json_report,
 )
 from codebase_lens.reports.manifest import OutputLayout
+from codebase_lens.analyzers.symbol_graph import collect_symbol_graph
+from codebase_lens.reports.symbol_graph import write_symbol_graph_reports
 from codebase_lens.reports.scanner_outputs import write_file_inventory, write_tree_report
 from codebase_lens.scanners.universe import discover_file_universe
 
@@ -220,7 +222,8 @@ def write_snapshot_bundle(
     omissions_path = _write_omissions_report(layout, universe, changed_only=changed_only)
     outputs["omissions_json"] = ".codecontext/latest/omissions.json"
 
-    python_files = _python_files_from_universe(universe)
+    all_python_files = _python_files_from_universe(universe)
+    python_files = list(all_python_files)
 
     changed_file_count = 0
     changed_symbol_count = 0
@@ -325,6 +328,15 @@ def write_snapshot_bundle(
         )
     )
 
+    graph_result = collect_symbol_graph(
+        root,
+        all_python_files,
+        focus_paths=set(python_files) if changed_only else set(),
+        focus_terms=focus_terms,
+    )
+    warnings.extend(graph_result.warnings)
+    outputs.update(write_symbol_graph_reports(layout, graph_result))
+
     counts = {
         "included_files": universe.counts.get("included_count", 0),
         "python_files_analyzed": len(python_files),
@@ -338,6 +350,9 @@ def write_snapshot_bundle(
         "changed_files": changed_file_count,
         "changed_symbols": changed_symbol_count,
         "omissions": len(getattr(universe, "omissions", ())),
+        "symbol_graph_nodes": graph_result.counts.get("nodes", 0),
+        "symbol_graph_call_edges": graph_result.counts.get("call_edges", 0),
+        "symbol_graph_caller_edges": graph_result.counts.get("caller_edges", 0),
     }
 
     _write_snapshot_index(

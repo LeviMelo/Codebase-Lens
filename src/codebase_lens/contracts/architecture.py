@@ -58,6 +58,9 @@ def builtin_cbl_contract() -> dict[str, Any]:
             "src/codebase_lens/analyzers/routes_static.py",
             "src/codebase_lens/analyzers/changed_symbols.py",
             "src/codebase_lens/analyzers/tests.py",
+            "src/codebase_lens/analyzers/symbol_graph.py",
+            "src/codebase_lens/reports/symbol_graph.py",
+            "scripts/dev/audits/audit_phase10_symbol_graph.py",
             "src/codebase_lens/analyzers/callers.py",
             "src/codebase_lens/reports/manifest.py",
             "src/codebase_lens/reports/json.py",
@@ -89,6 +92,22 @@ def builtin_cbl_contract() -> dict[str, Any]:
                     "_run_tests_inventory",
                     "_run_callers",
                     "_run_contract",
+                ],
+            },
+            {
+                "path": "src/codebase_lens/analyzers/symbol_graph.py",
+                "symbols": [
+                    "SymbolGraphNode",
+                    "SymbolGraphResult",
+                    "collect_symbol_graph",
+                    "symbol_graph_payload",
+                    "render_symbol_graph_markdown",
+                ],
+            },
+            {
+                "path": "src/codebase_lens/reports/symbol_graph.py",
+                "symbols": [
+                    "write_symbol_graph_reports",
                 ],
             },
             {
