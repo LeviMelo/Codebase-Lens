@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import re
 import subprocess
 from dataclasses import dataclass
@@ -68,10 +67,22 @@ def detect_repository_root(
             raise RootDetectionError(f"Repository override is not a directory: {explicit_repo}")
 
         git_root = _run_git_show_toplevel(root)
-        if git_root is not None:
-            return RootInfo(root=git_root, method="explicit-git", is_git_repo=True, git_root=git_root)
+        is_exact_git_root = git_root is not None and git_root == root
+        is_dot_git_root = (root / ".git").exists()
 
-        return RootInfo(root=root, method="explicit", is_git_repo=(root / ".git").exists(), git_root=None)
+        warnings: list[str] = []
+        if git_root is not None and git_root != root:
+            warnings.append(
+                "Explicit --repo is inside a larger Git work tree; CBL is honoring the explicit directory as analysis root."
+            )
+
+        return RootInfo(
+            root=root,
+            method="explicit",
+            is_git_repo=is_exact_git_root or is_dot_git_root,
+            git_root=root if is_exact_git_root or is_dot_git_root else None,
+            warnings=tuple(warnings),
+        )
 
     start_path = Path.cwd() if start is None else Path(start).expanduser()
     start_path = start_path.resolve()

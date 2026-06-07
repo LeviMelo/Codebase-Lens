@@ -1,12 +1,26 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from collections.abc import Sequence
+from dataclasses import asdict
 from pathlib import Path
 
 from codebase_lens import __version__
+from codebase_lens.analyzers.cli_static import collect_cli_commands, flatten_cli_results
 from codebase_lens.analyzers.excerpts import build_file_excerpt, render_excerpt_markdown
+from codebase_lens.analyzers.imports import (
+    collect_python_imports,
+    filter_imports_by_module,
+    flatten_import_results,
+)
+from codebase_lens.analyzers.python_ast import (
+    collect_python_symbols,
+    find_symbol_matches,
+    flatten_symbol_results,
+)
+from codebase_lens.analyzers.routes_static import collect_routes, flatten_route_results
 from codebase_lens.core.constants import (
     DEFAULT_BUDGET,
     DEFAULT_MAX_EXCERPT_BYTES,
@@ -19,10 +33,17 @@ from codebase_lens.core.constants import (
     PUBLIC_COMMANDS,
 )
 from codebase_lens.core.errors import CblError, PathSafetyError, RootDetectionError
-from codebase_lens.core.paths import detect_repository_root, display_path, gitignore_mentions_codecontext, resolve_user_path
+from codebase_lens.core.paths import detect_repository_root, display_path, gitignore_mentions_codecontext, resolve_user_path, to_posix_relative
 from codebase_lens.core.redaction import redact_console_text
 from codebase_lens.core.result import CblCommandResult, emit_result
 from codebase_lens.git.discover import collect_git_info
+from codebase_lens.reports.json import (
+    command_records_payload,
+    import_records_payload,
+    route_records_payload,
+    symbol_records_payload,
+    write_json_report,
+)
 from codebase_lens.reports.manifest import build_manifest, copy_latest_to_run, prepare_output_layout, write_manifest_bundle
 from codebase_lens.scanners.inventory import write_file_inventory
 from codebase_lens.scanners.tree import write_tree_report
@@ -79,23 +100,24 @@ def build_parser() -> argparse.ArgumentParser:
     symbols.add_argument("--path")
     symbols.add_argument("--query")
     symbols.add_argument("--json", action="store_true")
-    symbols.set_defaults(handler=_run_partial)
+    symbols.set_defaults(handler=_run_symbols)
 
     imports = sub.add_parser("imports", parents=[parent], help="Summarize import graph.")
     imports.add_argument("--path")
     imports.add_argument("--module")
     imports.add_argument("--reverse", action="store_true")
     imports.add_argument("--cycles", action="store_true")
-    imports.set_defaults(handler=_run_partial)
+    imports.set_defaults(handler=_run_imports)
 
     cli = sub.add_parser("cli", parents=[parent], help="Statically discover CLI commands.")
     cli.add_argument("--framework", choices=("typer", "click", "argparse", "all"), default="all")
     cli.add_argument("--path")
-    cli.set_defaults(handler=_run_partial)
+    cli.set_defaults(handler=_run_cli_static)
 
     routes = sub.add_parser("routes", parents=[parent], help="Statically discover web routes.")
     routes.add_argument("--framework", choices=("fastapi", "flask", "all"), default="all")
-    routes.set_defaults(handler=_run_partial)
+    routes.add_argument("--path")
+    routes.set_defaults(handler=_run_routes_static)
 
     tests = sub.add_parser("tests", parents=[parent], help="Inventory tests.")
     tests.add_argument("--target")
@@ -125,7 +147,7 @@ def build_parser() -> argparse.ArgumentParser:
     symbol.add_argument("--context", type=int, default=20)
     symbol.add_argument("--path")
     symbol.add_argument("--first", action="store_true")
-    symbol.set_defaults(handler=_run_partial)
+    symbol.set_defaults(handler=_run_symbol)
 
     callers = sub.add_parser("callers", parents=[parent], help="Find static call sites.")
     callers.add_argument("name")
@@ -193,6 +215,37 @@ def _base_manifest_args(args: argparse.Namespace, repo_root: Path, subcommand: s
         "redaction": redaction_payload,
         "file_universe": file_universe,
     }
+
+
+def _python_files_for_analysis(args: argparse.Namespace, repo_root: Path) -> tuple[list[str], object | None]:
+    if getattr(args, "path", None):
+        target = resolve_user_path(repo_root, args.path, allow_absolute=False, allow_hard_excluded=False)
+        relative = to_posix_relative(repo_root, target)
+        if target.suffix.lower() not in {".py", ".pyw", ".pyi"}:
+            raise ValueError(f"Not a Python source file: {relative}")
+        return [relative], None
+
+    universe = discover_file_universe(repo_root, max_file_bytes=args.max_file_bytes)
+    python_files = [
+        record.path
+        for record in universe.included_files
+        if Path(record.path).suffix.lower() in {".py", ".pyw", ".pyi"}
+    ]
+    return python_files, universe
+
+
+def _syntax_errors_from_results(results) -> list[str]:
+    errors: list[str] = []
+    for result in results:
+        errors.extend(result.syntax_errors)
+    return errors
+
+
+def _limitations_from_results(results) -> list[str]:
+    limitations: set[str] = set()
+    for result in results:
+        limitations.update(result.limitations)
+    return sorted(limitations)
 
 
 def _run_doctor(args: argparse.Namespace) -> int:
@@ -379,6 +432,409 @@ def _run_file(args: argparse.Namespace) -> int:
         print(excerpt_markdown)
         print(f"Excerpt report: {display_path(repo_root, excerpt_path, absolute=args.absolute_paths)}")
         print(f"Output manifest: {display_path(repo_root, manifest_path, absolute=args.absolute_paths)}")
+
+    return 0
+
+
+def _run_symbols(args: argparse.Namespace) -> int:
+    try:
+        root_info = _detect_root(args)
+        repo_root = root_info.root
+        python_files, universe = _python_files_for_analysis(args, repo_root)
+
+        results = collect_python_symbols(repo_root, python_files)
+        symbols = flatten_symbol_results(results)
+
+        if args.kind != "all":
+            symbols = tuple(record for record in symbols if record.kind == args.kind)
+
+        if args.query:
+            lowered = args.query.lower()
+            symbols = tuple(
+                record
+                for record in symbols
+                if lowered in record.name.lower() or lowered in record.qualified_name.lower()
+            )
+
+        syntax_errors = _syntax_errors_from_results(results)
+        payload = symbol_records_payload(symbols, syntax_errors=syntax_errors)
+
+        layout = prepare_output_layout(repo_root, args.out, archive=not args.no_archive)
+        symbols_path = write_json_report(layout.latest_dir / "symbols.json", payload)
+
+        manifest = build_manifest(
+            **_base_manifest_args(
+                args,
+                repo_root,
+                "symbols",
+                {
+                    "manifest_json": ".codecontext/latest/manifest.json",
+                    "symbols_json": ".codecontext/latest/symbols.json",
+                },
+                file_universe=universe.manifest_counts() if universe is not None else None,
+            )
+        )
+        manifest_path = write_manifest_bundle(layout, manifest)
+        copy_latest_to_run(layout)
+
+    except RootDetectionError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_ROOT_DETECTION_FAILURE
+    except PathSafetyError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_PATH_SAFETY_VIOLATION
+    except ValueError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_INVALID_ARGUMENTS
+    except OSError as exc:
+        print(redact_console_text(f"ERROR: Could not write symbol report: {exc}"))
+        return EXIT_OUTPUT_WRITE_FAILURE
+    except CblError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_GENERAL_ERROR
+
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+    elif not args.quiet:
+        print("CBL symbols: OK")
+        print(f"Python files analyzed: {len(python_files)}")
+        print(f"Symbols: {len(symbols)}")
+        print(f"Classes: {payload['counts']['classes']}")
+        print(f"Functions: {payload['counts']['functions']}")
+        print(f"Methods: {payload['counts']['methods']}")
+        print(f"Symbols report: {display_path(repo_root, symbols_path, absolute=args.absolute_paths)}")
+        print(f"Output manifest: {display_path(repo_root, manifest_path, absolute=args.absolute_paths)}")
+        if syntax_errors:
+            print(f"Syntax errors: {len(syntax_errors)}")
+
+    return 0
+
+
+def _run_symbol(args: argparse.Namespace) -> int:
+    try:
+        root_info = _detect_root(args)
+        repo_root = root_info.root
+        python_files, universe = _python_files_for_analysis(args, repo_root)
+        results = collect_python_symbols(repo_root, python_files)
+        symbols = flatten_symbol_results(results)
+
+        path_filter = None
+        if args.path:
+            target = resolve_user_path(repo_root, args.path, allow_absolute=False, allow_hard_excluded=False)
+            path_filter = to_posix_relative(repo_root, target)
+
+        matches = find_symbol_matches(symbols, args.symbol_name, path=path_filter)
+
+        layout = prepare_output_layout(repo_root, args.out, archive=not args.no_archive)
+
+        matches_payload = {
+            "query": args.symbol_name,
+            "matches": [asdict(record) for record in matches],
+            "count": len(matches),
+        }
+        matches_path = write_json_report(layout.latest_dir / "symbol_matches.json", matches_payload)
+
+        if not matches:
+            manifest = build_manifest(
+                **_base_manifest_args(
+                    args,
+                    repo_root,
+                    "symbol",
+                    {
+                        "manifest_json": ".codecontext/latest/manifest.json",
+                        "symbol_matches_json": ".codecontext/latest/symbol_matches.json",
+                    },
+                    file_universe=universe.manifest_counts() if universe is not None else None,
+                )
+            )
+            write_manifest_bundle(layout, manifest)
+            copy_latest_to_run(layout)
+            print(redact_console_text(f"ERROR: No symbol matched query: {args.symbol_name}"))
+            return EXIT_GENERAL_ERROR
+
+        selected = matches[0]
+        if len(matches) > 1 and not args.first and not args.path:
+            manifest = build_manifest(
+                **_base_manifest_args(
+                    args,
+                    repo_root,
+                    "symbol",
+                    {
+                        "manifest_json": ".codecontext/latest/manifest.json",
+                        "symbol_matches_json": ".codecontext/latest/symbol_matches.json",
+                    },
+                    file_universe=universe.manifest_counts() if universe is not None else None,
+                )
+            )
+            write_manifest_bundle(layout, manifest)
+            copy_latest_to_run(layout)
+            print(f"ERROR: Ambiguous symbol query matched {len(matches)} symbols. Use --first or --path.")
+            print(f"Symbol matches: {display_path(repo_root, matches_path, absolute=args.absolute_paths)}")
+            return EXIT_GENERAL_ERROR
+
+        target_path = repo_root / selected.path
+        start = max(1, selected.start_line - args.context)
+        end = selected.end_line + args.context
+        excerpt = build_file_excerpt(
+            repo_root,
+            target_path,
+            line_selector=f"{start}:{end}",
+            context=args.context,
+            max_file_bytes=min(args.max_file_bytes, DEFAULT_MAX_EXCERPT_BYTES),
+        )
+
+        excerpt_markdown = "\n".join(
+            [
+                "# CBL Symbol Excerpt",
+                "",
+                f"Symbol: {selected.qualified_name}",
+                f"Kind: {selected.kind}",
+                f"Definition: {selected.path}:L{selected.start_line}-L{selected.end_line}",
+                "",
+                render_excerpt_markdown(excerpt),
+            ]
+        )
+
+        excerpt_path = layout.latest_dir / "symbol_excerpt.md"
+        excerpt_path.write_text(excerpt_markdown + "\n", encoding="utf-8", newline="\n")
+
+        manifest = build_manifest(
+            **_base_manifest_args(
+                args,
+                repo_root,
+                "symbol",
+                {
+                    "manifest_json": ".codecontext/latest/manifest.json",
+                    "symbol_matches_json": ".codecontext/latest/symbol_matches.json",
+                    "symbol_excerpt_md": ".codecontext/latest/symbol_excerpt.md",
+                },
+                file_universe=universe.manifest_counts() if universe is not None else None,
+                redaction={
+                    "enabled": True,
+                    "redacted_files_count": 1 if excerpt.redaction.redacted_occurrences_count else 0,
+                    "redacted_occurrences_count": excerpt.redaction.redacted_occurrences_count,
+                    "patterns_hit": list(excerpt.redaction.patterns_hit),
+                },
+            )
+        )
+        manifest_path = write_manifest_bundle(layout, manifest)
+        copy_latest_to_run(layout)
+
+    except RootDetectionError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_ROOT_DETECTION_FAILURE
+    except PathSafetyError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_PATH_SAFETY_VIOLATION
+    except ValueError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_INVALID_ARGUMENTS
+    except OSError as exc:
+        print(redact_console_text(f"ERROR: Could not write symbol excerpt: {exc}"))
+        return EXIT_OUTPUT_WRITE_FAILURE
+    except CblError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_GENERAL_ERROR
+
+    if not args.quiet:
+        print(excerpt_markdown)
+        print(f"Symbol matches: {display_path(repo_root, matches_path, absolute=args.absolute_paths)}")
+        print(f"Symbol excerpt: {display_path(repo_root, excerpt_path, absolute=args.absolute_paths)}")
+        print(f"Output manifest: {display_path(repo_root, manifest_path, absolute=args.absolute_paths)}")
+
+    return 0
+
+
+def _run_imports(args: argparse.Namespace) -> int:
+    try:
+        root_info = _detect_root(args)
+        repo_root = root_info.root
+        python_files, universe = _python_files_for_analysis(args, repo_root)
+
+        results = collect_python_imports(repo_root, python_files)
+        imports = flatten_import_results(results)
+        imports = filter_imports_by_module(imports, args.module)
+        syntax_errors = _syntax_errors_from_results(results)
+
+        payload = import_records_payload(imports, syntax_errors=syntax_errors)
+        payload["limitations"] = []
+        if args.reverse:
+            payload["limitations"].append("Reverse import grouping is not yet implemented; raw records include resolved_project_path for downstream grouping.")
+        if args.cycles:
+            payload["limitations"].append("Cycle detection is not yet implemented; this slice only emits direct static import records.")
+
+        layout = prepare_output_layout(repo_root, args.out, archive=not args.no_archive)
+        imports_path = write_json_report(layout.latest_dir / "imports.json", payload)
+
+        manifest = build_manifest(
+            **_base_manifest_args(
+                args,
+                repo_root,
+                "imports",
+                {
+                    "manifest_json": ".codecontext/latest/manifest.json",
+                    "imports_json": ".codecontext/latest/imports.json",
+                },
+                file_universe=universe.manifest_counts() if universe is not None else None,
+            )
+        )
+        manifest_path = write_manifest_bundle(layout, manifest)
+        copy_latest_to_run(layout)
+
+    except RootDetectionError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_ROOT_DETECTION_FAILURE
+    except PathSafetyError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_PATH_SAFETY_VIOLATION
+    except ValueError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_INVALID_ARGUMENTS
+    except OSError as exc:
+        print(redact_console_text(f"ERROR: Could not write import report: {exc}"))
+        return EXIT_OUTPUT_WRITE_FAILURE
+    except CblError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_GENERAL_ERROR
+
+    if not args.quiet:
+        print("CBL imports: OK")
+        print(f"Python files analyzed: {len(python_files)}")
+        print(f"Imports: {len(imports)}")
+        print(f"Resolved project imports: {payload['counts']['resolved_project_imports']}")
+        print(f"Imports report: {display_path(repo_root, imports_path, absolute=args.absolute_paths)}")
+        print(f"Output manifest: {display_path(repo_root, manifest_path, absolute=args.absolute_paths)}")
+        for limitation in payload["limitations"]:
+            print(f"WARNING: {limitation}")
+        if syntax_errors:
+            print(f"Syntax errors: {len(syntax_errors)}")
+
+    return 0
+
+
+def _run_cli_static(args: argparse.Namespace) -> int:
+    try:
+        root_info = _detect_root(args)
+        repo_root = root_info.root
+        python_files, universe = _python_files_for_analysis(args, repo_root)
+
+        results = collect_cli_commands(repo_root, python_files, framework=args.framework)
+        commands = flatten_cli_results(results)
+        syntax_errors = _syntax_errors_from_results(results)
+        limitations = _limitations_from_results(results)
+
+        payload = command_records_payload(commands, syntax_errors=syntax_errors, limitations=limitations)
+
+        layout = prepare_output_layout(repo_root, args.out, archive=not args.no_archive)
+        commands_path = write_json_report(layout.latest_dir / "commands.json", payload)
+
+        manifest = build_manifest(
+            **_base_manifest_args(
+                args,
+                repo_root,
+                "cli",
+                {
+                    "manifest_json": ".codecontext/latest/manifest.json",
+                    "commands_json": ".codecontext/latest/commands.json",
+                },
+                file_universe=universe.manifest_counts() if universe is not None else None,
+            )
+        )
+        manifest_path = write_manifest_bundle(layout, manifest)
+        copy_latest_to_run(layout)
+
+    except RootDetectionError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_ROOT_DETECTION_FAILURE
+    except PathSafetyError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_PATH_SAFETY_VIOLATION
+    except ValueError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_INVALID_ARGUMENTS
+    except OSError as exc:
+        print(redact_console_text(f"ERROR: Could not write CLI command report: {exc}"))
+        return EXIT_OUTPUT_WRITE_FAILURE
+    except CblError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_GENERAL_ERROR
+
+    if not args.quiet:
+        print("CBL cli: OK")
+        print(f"Python files analyzed: {len(python_files)}")
+        print(f"Commands: {len(commands)}")
+        print(f"Argparse commands: {payload['counts']['argparse']}")
+        print(f"Click commands: {payload['counts']['click']}")
+        print(f"Typer commands: {payload['counts']['typer']}")
+        print(f"Commands report: {display_path(repo_root, commands_path, absolute=args.absolute_paths)}")
+        print(f"Output manifest: {display_path(repo_root, manifest_path, absolute=args.absolute_paths)}")
+        for limitation in limitations:
+            print(f"WARNING: {limitation}")
+        if syntax_errors:
+            print(f"Syntax errors: {len(syntax_errors)}")
+
+    return 0
+
+
+def _run_routes_static(args: argparse.Namespace) -> int:
+    try:
+        root_info = _detect_root(args)
+        repo_root = root_info.root
+        python_files, universe = _python_files_for_analysis(args, repo_root)
+
+        results = collect_routes(repo_root, python_files, framework=args.framework)
+        routes = flatten_route_results(results)
+        syntax_errors = _syntax_errors_from_results(results)
+        limitations = _limitations_from_results(results)
+
+        payload = route_records_payload(routes, syntax_errors=syntax_errors, limitations=limitations)
+
+        layout = prepare_output_layout(repo_root, args.out, archive=not args.no_archive)
+        routes_path = write_json_report(layout.latest_dir / "routes.json", payload)
+
+        manifest = build_manifest(
+            **_base_manifest_args(
+                args,
+                repo_root,
+                "routes",
+                {
+                    "manifest_json": ".codecontext/latest/manifest.json",
+                    "routes_json": ".codecontext/latest/routes.json",
+                },
+                file_universe=universe.manifest_counts() if universe is not None else None,
+            )
+        )
+        manifest_path = write_manifest_bundle(layout, manifest)
+        copy_latest_to_run(layout)
+
+    except RootDetectionError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_ROOT_DETECTION_FAILURE
+    except PathSafetyError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_PATH_SAFETY_VIOLATION
+    except ValueError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_INVALID_ARGUMENTS
+    except OSError as exc:
+        print(redact_console_text(f"ERROR: Could not write route report: {exc}"))
+        return EXIT_OUTPUT_WRITE_FAILURE
+    except CblError as exc:
+        print(redact_console_text(f"ERROR: {exc}"))
+        return EXIT_GENERAL_ERROR
+
+    if not args.quiet:
+        print("CBL routes: OK")
+        print(f"Python files analyzed: {len(python_files)}")
+        print(f"Routes: {len(routes)}")
+        print(f"FastAPI routes: {payload['counts']['fastapi']}")
+        print(f"Flask routes: {payload['counts']['flask']}")
+        print(f"Routes report: {display_path(repo_root, routes_path, absolute=args.absolute_paths)}")
+        print(f"Output manifest: {display_path(repo_root, manifest_path, absolute=args.absolute_paths)}")
+        for limitation in limitations:
+            print(f"WARNING: {limitation}")
+        if syntax_errors:
+            print(f"Syntax errors: {len(syntax_errors)}")
 
     return 0
 
