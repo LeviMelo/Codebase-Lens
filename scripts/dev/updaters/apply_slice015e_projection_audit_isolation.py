@@ -1,6 +1,16 @@
 from __future__ import annotations
 
 import ast
+import shutil
+from pathlib import Path
+from textwrap import dedent
+
+ROOT = Path.cwd()
+
+AUDIT = r'''
+from __future__ import annotations
+
+import ast
 import json
 import os
 import shutil
@@ -213,6 +223,66 @@ def main() -> int:
         fail("Audit recreated .tmp_projection_generality inside the repository root.")
 
     print("PASS: Phase 16 projection generality audit passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
+
+def normalize(content: str) -> str:
+    return dedent(content).strip("\n") + "\n"
+
+
+def write_file(relative: str, content: str, modified: set[Path]) -> None:
+    path = ROOT / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(normalize(content), encoding="utf-8", newline="\n")
+    if path.suffix == ".py":
+        modified.add(path)
+
+
+def patch_gitignore() -> None:
+    path = ROOT / ".gitignore"
+    text = path.read_text(encoding="utf-8") if path.is_file() else ""
+    entries = [
+        ".tmp_projection_generality/",
+        ".tmp_projection_generality/**",
+    ]
+    changed = False
+    for entry in entries:
+        if entry not in text:
+            if text and not text.endswith("\n"):
+                text += "\n"
+            text += entry + "\n"
+            changed = True
+    if changed:
+        path.write_text(text, encoding="utf-8", newline="\n")
+
+
+def assert_parseable(paths: set[Path]) -> None:
+    for path in sorted(paths):
+        try:
+            ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError as exc:
+            raise RuntimeError(f"Generated invalid Python in {path}: {exc}") from exc
+
+
+def main() -> int:
+    modified: set[Path] = set()
+
+    stale = ROOT / ".tmp_projection_generality"
+    if stale.exists():
+        shutil.rmtree(stale)
+
+    write_file("scripts/dev/audits/audit_phase16_projection_generality.py", AUDIT, modified)
+    patch_gitignore()
+    assert_parseable(modified)
+
+    print("Slice 015E applied: projection generality audit now isolates synthetic repos outside the project root.")
+    print("Stale .tmp_projection_generality was removed if present.")
+    print("The updater parsed every modified Python file before exiting.")
     return 0
 
 

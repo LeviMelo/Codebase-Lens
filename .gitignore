@@ -13,3 +13,5 @@ dist/
 .idea/
 .DS_Store
 Thumbs.db
+.tmp_projection_generality/
+.tmp_projection_generality/**
