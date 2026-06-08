@@ -408,7 +408,13 @@ def _symbol_role(node: dict[str, Any], profile: ProjectProfile) -> str:
     return path_role
 
 
-def _symbol_score(node: dict[str, Any], incoming: Counter[str], outgoing: Counter[str], profile: ProjectProfile) -> float:
+def _symbol_score(
+    node: dict[str, Any],
+    incoming: Counter[str],
+    outgoing: Counter[str],
+    profile: ProjectProfile,
+    focus_terms: tuple[str, ...] = (),
+) -> float:
     node_id = _node_id(node)
     label = _node_label(node)
     path = _node_path(node)
@@ -459,10 +465,23 @@ def _symbol_score(node: dict[str, Any], incoming: Counter[str], outgoing: Counte
     if _is_low_value_path(path):
         score -= 250.0
 
+    focus_blob = " ".join(focus_terms).lower()
+    self_projection_blob = f"{path} {label}".lower()
+    focus_mentions_projection = any(term in focus_blob for term in {"handoff", "projection", "pack"})
+    if "handoff" in self_projection_blob and "projection" in self_projection_blob and not focus_mentions_projection:
+        score -= 90.0
+
     return score
 
 
-def _rank_product_symbols(nodes: list[dict[str, Any]], edges: list[dict[str, Any]], profile: ProjectProfile, *, limit: int) -> list[dict[str, Any]]:
+def _rank_product_symbols(
+    nodes: list[dict[str, Any]],
+    edges: list[dict[str, Any]],
+    profile: ProjectProfile,
+    *,
+    limit: int,
+    focus_terms: tuple[str, ...] = (),
+) -> list[dict[str, Any]]:
     incoming = Counter(str(edge.get("target")) for edge in edges if isinstance(edge, dict) and edge.get("target"))
     outgoing = Counter(str(edge.get("source")) for edge in edges if isinstance(edge, dict) and edge.get("source"))
 
@@ -477,7 +496,7 @@ def _rank_product_symbols(nodes: list[dict[str, Any]], edges: list[dict[str, Any
     ranked = sorted(
         symbols,
         key=lambda node: (
-            -_symbol_score(node, incoming, outgoing, profile),
+            -_symbol_score(node, incoming, outgoing, profile, focus_terms=focus_terms),
             _node_path(node),
             _node_label(node),
         ),
@@ -633,6 +652,69 @@ def _edge_payload(edge: dict[str, Any], nodes_by_id: dict[str, dict[str, Any]], 
     }
 
 
+def _representative_edge_key(payload: dict[str, Any]) -> tuple[str, str, str, str]:
+    return (
+        str(payload.get("kind") or ""),
+        str(payload.get("source") or ""),
+        str(payload.get("target") or ""),
+        str(payload.get("edge_family") or ""),
+    )
+
+
+def _collapse_representative_edge_candidates(
+    ranked_edges: list[dict[str, Any]],
+    nodes_by_id: dict[str, dict[str, Any]],
+    profile: ProjectProfile,
+) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+
+    for edge in ranked_edges:
+        payload = _edge_payload(edge, nodes_by_id, profile)
+        key = _representative_edge_key(payload)
+        evidence = str(payload.get("evidence") or "")
+        score = float(payload.get("relevance_score") or 0.0)
+
+        if key not in groups:
+            groups[key] = {
+                "payload": payload,
+                "best_score": score,
+                "evidence_count": 0,
+                "sample_evidence": [],
+            }
+
+        group = groups[key]
+        group["evidence_count"] = int(group["evidence_count"]) + 1
+
+        samples = group["sample_evidence"]
+        if evidence and evidence not in samples:
+            samples.append(evidence)
+
+        if score > float(group["best_score"]):
+            group["payload"] = payload
+            group["best_score"] = score
+
+    collapsed: list[dict[str, Any]] = []
+    for group in groups.values():
+        payload = dict(group["payload"])
+        samples = list(group["sample_evidence"])[:5]
+        payload["evidence_count"] = int(group["evidence_count"])
+        payload["sample_evidence"] = samples
+        if samples:
+            payload["evidence"] = samples[0]
+        collapsed.append(payload)
+
+    return sorted(
+        collapsed,
+        key=lambda item: (
+            -float(item.get("relevance_score") or 0.0),
+            -int(item.get("evidence_count") or 0),
+            str(item.get("edge_family") or ""),
+            str(item.get("source") or ""),
+            str(item.get("target") or ""),
+        ),
+    )
+
+
 def _representative_edges(nodes: list[dict[str, Any]], edges: list[dict[str, Any]], profile: ProjectProfile, *, limit: int) -> list[dict[str, Any]]:
     nodes_by_id = _node_by_id(nodes)
 
@@ -676,7 +758,7 @@ def _representative_edges(nodes: list[dict[str, Any]], edges: list[dict[str, Any
     if not raw_candidates:
         raw_candidates = fallback_external_imports
 
-    ranked = sorted(
+    ranked_edges = sorted(
         raw_candidates,
         key=lambda edge: (
             -_edge_relevance_score(edge, nodes_by_id, profile),
@@ -687,44 +769,45 @@ def _representative_edges(nodes: list[dict[str, Any]], edges: list[dict[str, Any
         ),
     )
 
+    ranked = _collapse_representative_edge_candidates(ranked_edges, nodes_by_id, profile)
+
     family_caps = {
-        "cli_to_handler": 4,
-        "handler_to_analysis": 5,
-        "analysis_to_report": 4,
-        "report_to_output_writer": 3,
-        "import_dependency": 4,
+        "cli_to_handler": 3,
+        "handler_to_analysis": 4,
+        "analysis_to_report": 3,
+        "report_to_output_writer": 2,
+        "import_dependency": 3,
         "external_import_dependency": 1,
-        "analysis_to_model": 4,
+        "analysis_to_model": 3,
         "scanner_or_io_flow": 3,
-        "declaration_context": 2,
-        "other_product_flow": 4,
+        "declaration_context": 1,
+        "other_product_flow": 3,
     }
+
+    coverage_order = [
+        "handler_to_analysis",
+        "analysis_to_model",
+        "scanner_or_io_flow",
+        "analysis_to_report",
+        "report_to_output_writer",
+        "cli_to_handler",
+        "import_dependency",
+        "other_product_flow",
+        "declaration_context",
+        "external_import_dependency",
+    ]
 
     selected_edges: list[dict[str, Any]] = []
     selected_keys: set[tuple[str, str, str, str]] = set()
     family_counts: Counter[str] = Counter()
 
-    families_present: list[str] = []
-    for edge in ranked:
-        source = _source_node(edge, nodes_by_id)
-        target = _target_node(edge, nodes_by_id)
-        family = _edge_family(edge, source, target, profile)
-        if family not in families_present:
-            families_present.append(family)
-
-    def add(edge: dict[str, Any]) -> bool:
-        payload = _edge_payload(edge, nodes_by_id, profile)
-        key = (
-            str(payload.get("kind")),
-            str(payload.get("source")),
-            str(payload.get("target")),
-            str(payload.get("evidence")),
-        )
+    def add(payload: dict[str, Any]) -> bool:
+        key = _representative_edge_key(payload)
         if key in selected_keys:
             return False
 
-        family = str(payload["edge_family"])
-        if family_counts[family] >= family_caps.get(family, 3):
+        family = str(payload.get("edge_family") or "")
+        if family_counts[family] >= family_caps.get(family, 2):
             return False
 
         selected_edges.append(payload)
@@ -732,20 +815,18 @@ def _representative_edges(nodes: list[dict[str, Any]], edges: list[dict[str, Any
         family_counts[family] += 1
         return True
 
-    for family in families_present:
-        for edge in ranked:
-            source = _source_node(edge, nodes_by_id)
-            target = _target_node(edge, nodes_by_id)
-            if _edge_family(edge, source, target, profile) == family:
-                add(edge)
+    for family in coverage_order:
+        for payload in ranked:
+            if payload.get("edge_family") == family:
+                add(payload)
                 break
-        if len(selected_edges) >= min(limit, len(families_present)):
-            break
-
-    for edge in ranked:
         if len(selected_edges) >= limit:
             break
-        add(edge)
+
+    for payload in ranked:
+        if len(selected_edges) >= limit:
+            break
+        add(payload)
 
     return selected_edges[:limit]
 
@@ -951,7 +1032,7 @@ def _projection_payload(
     return {
         "schema": {
             "name": "cbl.handoff_projection",
-            "version": 3,
+            "version": 4,
         },
         "issue": issue,
         "scope": "changed" if changed_only else "full",
@@ -983,7 +1064,7 @@ def _projection_payload(
                     "role": _symbol_role(node, profile),
                     "signature": _node_data(node).get("signature"),
                 }
-                for node in _rank_product_symbols(nodes, edges, profile, limit=12)
+                for node in _rank_product_symbols(nodes, edges, profile, limit=12, focus_terms=focus_terms)
             ],
             "entrypoints": [
                 {
@@ -1117,17 +1198,23 @@ def _render_projection_markdown(payload: dict[str, Any]) -> str:
         for item in representative_edges:
             if not isinstance(item, dict):
                 continue
-            evidence = f" Evidence: `{item.get('evidence')}`." if item.get("evidence") else ""
+            sample_evidence = _as_list(item.get("sample_evidence"))
+            evidence = sample_evidence[0] if sample_evidence else item.get("evidence")
+            evidence_count = int(item.get("evidence_count") or (1 if evidence else 0))
+            evidence_text = f" Evidence: `{evidence}`." if evidence else ""
             lines.append(
                 _bullet(
                     f"`{item.get('kind')}`: `{item.get('source')}` → `{item.get('target')}` "
-                    f"[{item.get('confidence')}].{evidence}"
+                    f"[{item.get('confidence')}].{evidence_text}"
                 )
             )
             lines.append(
                 f"  - Family: `{item.get('edge_family')}`; reason: {item.get('selection_reason')}; "
                 f"score: `{item.get('relevance_score')}`; roles: `{item.get('source_role')}` → `{item.get('target_role')}`"
             )
+            if evidence_count > 1:
+                shown = ", ".join(f"`{value}`" for value in sample_evidence[:3])
+                lines.append(f"  - Evidence count: `{evidence_count}`; sample evidence: {shown}")
     else:
         lines.append("- No representative product dependency edges were selected.")
 

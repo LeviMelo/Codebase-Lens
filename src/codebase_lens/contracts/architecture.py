@@ -83,6 +83,7 @@ def builtin_cbl_contract() -> dict[str, Any]:
             "scripts/dev/audits/audit_phase15_projection_semantics.py",
             "scripts/dev/audits/audit_phase16_projection_generality.py",
             "scripts/dev/audits/audit_phase17_projection_noise.py",
+            "scripts/dev/audits/audit_phase18_projection_dedup.py",
 ],
         "required_symbols": [
             {
