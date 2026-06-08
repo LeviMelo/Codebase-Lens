@@ -1,5 +1,15 @@
 from __future__ import annotations
 
+import ast
+import re
+from pathlib import Path
+from textwrap import dedent
+
+ROOT = Path.cwd()
+
+HANDOFF_PROJECTION = r'''
+from __future__ import annotations
+
 import json
 from collections import Counter
 from dataclasses import dataclass
@@ -1026,3 +1036,321 @@ def write_handoff_projection_reports(
         "handoff_projection_json": ".codecontext/latest/handoff_projection.json",
         "handoff_projection_md": ".codecontext/latest/handoff_projection.md",
     }
+'''
+
+AUDIT = r'''
+from __future__ import annotations
+
+import ast
+import json
+import os
+import subprocess
+import sys
+from collections import Counter
+from pathlib import Path
+
+ROOT = Path.cwd()
+SRC = ROOT / "src"
+
+
+def fail(message: str) -> None:
+    print(f"FAIL: {message}")
+    raise SystemExit(1)
+
+
+def run_cbl(*args: str) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(SRC)
+    return subprocess.run(
+        [sys.executable, "-m", "codebase_lens", *args],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def assert_parseable(relative: str) -> None:
+    path = ROOT / relative
+    try:
+        ast.parse(path.read_text(encoding="utf-8"))
+    except SyntaxError as exc:
+        fail(f"{relative} is not parseable: {exc}")
+
+
+def section(text: str, heading: str) -> str:
+    marker = f"## {heading}"
+    start = text.find(marker)
+    if start == -1:
+        fail(f"Missing section: {heading}")
+    next_start = text.find("\n## ", start + len(marker))
+    if next_start == -1:
+        return text[start:]
+    return text[start:next_start]
+
+
+def main() -> int:
+    for relative in [
+        "src/codebase_lens/reports/handoff_projection.py",
+        "src/codebase_lens/reports/handoff.py",
+        "src/codebase_lens/cli.py",
+    ]:
+        assert_parseable(relative)
+
+    result = run_cbl("pack", "--issue", "phase 15 projection semantics audit", "--budget", "24000", "--no-archive")
+    if result.returncode != 0:
+        fail(f"cbl pack failed:\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}")
+
+    latest = ROOT / ".codecontext" / "latest"
+    projection_path = latest / "handoff_projection.md"
+    projection_json_path = latest / "handoff_projection.json"
+
+    if not projection_path.is_file():
+        fail("handoff_projection.md was not generated.")
+    if not projection_json_path.is_file():
+        fail("handoff_projection.json was not generated.")
+
+    text = projection_path.read_text(encoding="utf-8")
+    payload = json.loads(projection_json_path.read_text(encoding="utf-8"))
+
+    representative = section(text, "Representative Dependency Edges")
+    unresolved = section(text, "Dynamic / Unresolved Calls")
+
+    if "src/codebase_lens/" not in representative:
+        fail("Representative edges do not surface product code.")
+    if "::" not in representative:
+        fail("Representative edges do not path-qualify symbol display.")
+    if "scripts/dev/audits/" in representative:
+        fail("Representative edges are polluted by audit helper files.")
+    if "`fail`" in representative or "`run_cbl`" in representative or "`names_in_file`" in representative:
+        fail("Representative edges include low-value audit helper symbols.")
+    if "Family:" not in representative or "reason:" not in representative or "score:" not in representative:
+        fail("Representative edges do not expose selection metadata.")
+
+    if "scripts/dev/audits/" in unresolved:
+        fail("Unresolved calls are polluted by audit helper files.")
+    if "`print`" in unresolved or "`SystemExit`" in unresolved:
+        fail("Unresolved calls include low-value builtins/audit exits.")
+
+    graph = payload.get("graph", {})
+    edges = graph.get("representative_edges", [])
+    if not isinstance(edges, list) or not edges:
+        fail("handoff_projection.json has no representative edges.")
+
+    required_edge_fields = {"edge_family", "selection_reason", "relevance_score", "source_path", "target_path"}
+    for edge in edges[:10]:
+        missing = required_edge_fields - set(edge)
+        if missing:
+            fail(f"Representative edge missing fields: {sorted(missing)}")
+        blob = json.dumps(edge, sort_keys=True)
+        if "scripts/dev/audits/" in blob:
+            fail("handoff_projection.json representative edges include audit paths.")
+
+    family_counts = Counter(str(edge.get("edge_family")) for edge in edges)
+    if family_counts["cli_orchestration"] > 4:
+        fail("Representative edges overuse cli_orchestration family.")
+    if family_counts["reporting_manifest"] > 4:
+        fail("Representative edges overuse reporting_manifest family.")
+
+    if "dynamic_or_dispatch_calls" not in graph:
+        fail("Projection JSON missing dynamic_or_dispatch_calls.")
+    if "external_library_calls" not in graph:
+        fail("Projection JSON missing external_library_calls.")
+    if "attribute_or_external_calls" not in graph:
+        fail("Projection JSON missing attribute_or_external_calls.")
+    if "omitted_low_value_unresolved_call_count" not in graph:
+        fail("Projection JSON missing omitted low-value unresolved call count.")
+
+    if "External/library calls summarized" not in unresolved and graph.get("external_library_calls"):
+        fail("Markdown does not summarize external/library calls.")
+
+    if graph.get("omitted_low_value_unresolved_call_count", 0) < 1:
+        fail("Projection did not count omitted low-value unresolved calls.")
+
+    print("PASS: Phase 15 projection semantics audit passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
+TEST = r'''
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from collections import Counter
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+
+
+def run_cbl(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(SRC)
+    return subprocess.run(
+        [sys.executable, "-m", "codebase_lens", *args],
+        cwd=cwd or ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def test_handoff_projection_adds_semantic_edge_metadata_and_filters_low_value_calls() -> None:
+    result = run_cbl("pack", "--issue", "projection semantics test", "--budget", "24000", "--no-archive")
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    latest = ROOT / ".codecontext" / "latest"
+    text = (latest / "handoff_projection.md").read_text(encoding="utf-8")
+    payload = json.loads((latest / "handoff_projection.json").read_text(encoding="utf-8"))
+
+    representative_start = text.index("## Representative Dependency Edges")
+    unresolved_start = text.index("## Dynamic / Unresolved Calls")
+    changed_start = text.index("## Changed Scope")
+
+    representative = text[representative_start:unresolved_start]
+    unresolved = text[unresolved_start:changed_start]
+
+    assert "src/codebase_lens/" in representative
+    assert "::" in representative
+    assert "Family:" in representative
+    assert "reason:" in representative
+    assert "score:" in representative
+    assert "scripts/dev/audits/" not in representative
+    assert "`fail`" not in representative
+    assert "`run_cbl`" not in representative
+
+    assert "scripts/dev/audits/" not in unresolved
+    assert "`print`" not in unresolved
+    assert "`SystemExit`" not in unresolved
+
+    graph = payload["graph"]
+    edges = graph["representative_edges"]
+    assert edges
+
+    for edge in edges:
+        assert "edge_family" in edge
+        assert "selection_reason" in edge
+        assert "relevance_score" in edge
+        assert "source_path" in edge
+        assert "target_path" in edge
+
+    families = Counter(edge["edge_family"] for edge in edges)
+    assert families["cli_orchestration"] <= 4
+    assert families["reporting_manifest"] <= 4
+    assert {"pack_snapshot_flow", "evidence_graph_flow", "symbol_graph_flow", "graph_query_flow"} & set(families)
+
+    assert "dynamic_or_dispatch_calls" in graph
+    assert "external_library_calls" in graph
+    assert "attribute_or_external_calls" in graph
+    assert "omitted_low_value_unresolved_call_count" in graph
+    assert graph["omitted_low_value_unresolved_call_count"] >= 1
+
+    for item in graph["dynamic_or_dispatch_calls"]:
+        blob = json.dumps(item, sort_keys=True)
+        assert "scripts/dev/audits/" not in blob
+        assert "SystemExit" not in blob
+        assert "print" not in blob
+'''
+
+def normalize(content: str) -> str:
+    return dedent(content).strip("\n") + "\n"
+
+
+def write_file(relative: str, content: str, modified: set[Path]) -> None:
+    path = ROOT / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(normalize(content), encoding="utf-8", newline="\n")
+    if path.suffix == ".py":
+        modified.add(path)
+
+
+def list_bounds_for_key(text: str, key: str) -> tuple[int, int]:
+    match = re.search(rf'(?P<quote>["\']){re.escape(key)}(?P=quote)\s*:\s*\[', text)
+    if not match:
+        raise RuntimeError(f"Could not find list key {key!r}.")
+
+    open_index = text.find("[", match.start())
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    i = open_index
+
+    while i < len(text):
+        ch = text[i]
+
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == quote:
+                quote = None
+            i += 1
+            continue
+
+        if ch in {"'", '"'}:
+            quote = ch
+        elif ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                return open_index, i
+
+        i += 1
+
+    raise RuntimeError(f"Could not find closing bracket for {key!r}.")
+
+
+def insert_before_list_close(text: str, key: str, block: str) -> str:
+    _, close = list_bounds_for_key(text, key)
+    return text[:close] + block + text[close:]
+
+
+def patch_contract(modified: set[Path]) -> None:
+    path = ROOT / "src" / "codebase_lens" / "contracts" / "architecture.py"
+    text = path.read_text(encoding="utf-8")
+
+    required_file = "scripts/dev/audits/audit_phase15_projection_semantics.py"
+    if f'"{required_file}"' not in text and f"'{required_file}'" not in text:
+        text = insert_before_list_close(text, "required_files", f'            "{required_file}",\n')
+
+    path.write_text(text, encoding="utf-8", newline="\n")
+    modified.add(path)
+
+
+def assert_parseable(paths: set[Path]) -> None:
+    for path in sorted(paths):
+        if path.suffix != ".py":
+            continue
+        try:
+            ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError as exc:
+            raise RuntimeError(f"Generated invalid Python in {path}: {exc}") from exc
+
+
+def main() -> int:
+    modified: set[Path] = set()
+
+    write_file("src/codebase_lens/reports/handoff_projection.py", HANDOFF_PROJECTION, modified)
+    write_file("scripts/dev/audits/audit_phase15_projection_semantics.py", AUDIT, modified)
+    write_file("tests/test_handoff_projection_semantics.py", TEST, modified)
+    patch_contract(modified)
+
+    assert_parseable(modified)
+
+    print("Slice 015C applied: handoff projection semantics cleaned up.")
+    print("The updater parsed every modified Python file before exiting.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

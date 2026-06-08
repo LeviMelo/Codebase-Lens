@@ -80,6 +80,7 @@ def builtin_cbl_contract() -> dict[str, Any]:
             "src/codebase_lens/reports/handoff_projection.py",
             "scripts/dev/audits/audit_phase13_handoff_projection_sidecar.py",
             "scripts/dev/audits/audit_phase14_projection_relevance.py",
+            "scripts/dev/audits/audit_phase15_projection_semantics.py",
 ],
         "required_symbols": [
             {
