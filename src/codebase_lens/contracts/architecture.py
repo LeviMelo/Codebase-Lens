@@ -98,6 +98,10 @@ def builtin_cbl_contract() -> dict[str, Any]:
             "docs/AI_HANDOFF_WORKFLOW.md",
             "docs/RELEASE_CHECKLIST.md",
             "scripts/dev/audits/audit_phase24_documentation_workflow.py",
+            "src/codebase_lens/core/budget.py",
+            "src/codebase_lens/reports/diff.py",
+            "src/codebase_lens/reports/contract.py",
+            "scripts/dev/audits/audit_phase25_report_contract_parity.py",
 ],
         "required_symbols": [
             {
@@ -216,6 +220,29 @@ def builtin_cbl_contract() -> dict[str, Any]:
                 "symbols": [
                     "HandoffProjectionResult",
                     "write_handoff_projection_reports",
+                ],
+            },
+            {
+                "path": "src/codebase_lens/core/budget.py",
+                "symbols": [
+                    "estimate_tokens_for_bytes",
+                    "estimate_tokens_for_text",
+                    "ranked_budget_file_records",
+                    "build_budget_report_payload",
+                ],
+            },
+            {
+                "path": "src/codebase_lens/reports/diff.py",
+                "symbols": [
+                    "render_diff_summary_markdown",
+                    "write_diff_reports",
+                ],
+            },
+            {
+                "path": "src/codebase_lens/reports/contract.py",
+                "symbols": [
+                    "render_contract_audit_markdown",
+                    "write_contract_audit_reports",
                 ],
             },
 ],

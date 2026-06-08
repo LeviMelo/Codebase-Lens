@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,8 @@ from codebase_lens.reports.graph import write_evidence_graph_reports
 from codebase_lens.reports.symbol_graph import write_symbol_graph_reports
 from codebase_lens.reports.scanner_outputs import write_file_inventory, write_tree_report
 from codebase_lens.scanners.universe import discover_file_universe
+from codebase_lens.core.budget import build_budget_report_payload
+from codebase_lens.git.discover import collect_git_info
 
 
 @dataclass(frozen=True)
@@ -130,48 +133,274 @@ def _write_budget_report(
     changed_only: bool,
     python_files: list[str],
 ) -> Path:
-    included_files = list(getattr(universe, "included_files", ()))
+    payload = build_budget_report_payload(
+        getattr(universe, "included_files", ()),
+        budget=budget,
+        focus_terms=focus_terms,
+        changed_only=changed_only,
+        python_files=python_files,
+    )
+    return write_json_report(layout.latest_dir / "budget_report.json", payload)
+def _git_state_payload(repo_root: Path) -> dict[str, Any]:
+    git_info = collect_git_info(repo_root)
+    diff_result = collect_changed_files(repo_root, include_untracked=True)
 
-    ranked_files = []
-    for record in included_files:
-        path = getattr(record, "path", "")
-        size_bytes = int(getattr(record, "size_bytes", 0) or 0)
-        estimated_tokens = max(1, size_bytes // 4) if size_bytes else 1
-        focus_hits = _focus_hits_for_path(path, focus_terms)
-        ranked_files.append(
-            {
-                "path": path,
-                "size_bytes": size_bytes,
-                "estimated_tokens": estimated_tokens,
-                "focus_hits": focus_hits,
-                "priority_score": focus_hits * 1000 + max(0, 100000 - size_bytes),
-            }
-        )
-
-    ranked_files.sort(key=lambda item: (-int(item["priority_score"]), str(item["path"])))
-
-    total_estimated_tokens = sum(int(item["estimated_tokens"]) for item in ranked_files)
-    payload = {
+    return {
         "schema": {
-            "name": "cbl.budget_report",
+            "name": "cbl.git_state",
             "version": 1,
         },
-        "scope": "changed" if changed_only else "full",
-        "requested_budget_tokens": budget,
-        "focus_terms": list(focus_terms),
-        "estimation_method": "heuristic: max(1, file_size_bytes // 4)",
-        "total_estimated_file_tokens": total_estimated_tokens,
-        "budget_pressure": "over_budget" if total_estimated_tokens > budget else "within_budget",
-        "python_files_analyzed": python_files,
-        "ranked_files": ranked_files[:250],
-        "counts": {
-            "ranked_files": len(ranked_files),
-            "python_files_analyzed": len(python_files),
-            "focus_terms": len(focus_terms),
+        "git": {
+            "available": git_info.available,
+            "is_repo": git_info.is_repo,
+            "branch": git_info.branch,
+            "head": git_info.head,
+            "is_dirty": git_info.is_dirty,
+            "staged_count": git_info.staged_count,
+            "unstaged_count": git_info.unstaged_count,
+            "untracked_count": git_info.untracked_count,
+            "warnings": list(git_info.warnings),
         },
+        "changed_files": [_jsonable(record) for record in diff_result.changed_files],
+        "counts": dict(diff_result.counts),
+        "warnings": list(diff_result.warnings),
     }
-    return write_json_report(layout.latest_dir / "budget_report.json", payload)
 
+
+def _write_git_state_report(layout: OutputLayout, repo_root: Path) -> Path:
+    return write_json_report(layout.latest_dir / "git_state.json", _git_state_payload(repo_root))
+
+
+def _read_json_if_present(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _read_text_excerpt(path: Path, *, max_lines: int = 80) -> str:
+    if not path.is_file():
+        return "(not emitted)"
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    if len(lines) > max_lines:
+        return "\n".join(lines[:max_lines] + [f"... {len(lines) - max_lines} additional lines omitted from snapshot markdown."])
+    return "\n".join(lines) if lines else "(empty)"
+
+
+def _extension_summary(universe) -> list[str]:
+    counts: dict[str, int] = {}
+    for record in getattr(universe, "included_files", ()):
+        suffix = Path(str(getattr(record, "path", ""))).suffix.lower() or "<none>"
+        counts[suffix] = counts.get(suffix, 0) + 1
+    return [f"- `{suffix}`: {count}" for suffix, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:40]]
+
+
+def _project_markers(root: Path) -> list[str]:
+    markers = [
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "package.json",
+        "Cargo.toml",
+        "go.mod",
+        "pom.xml",
+        "build.gradle",
+    ]
+    return [marker for marker in markers if (root / marker).exists()]
+
+
+def _write_repo_snapshot_markdown(
+    layout: OutputLayout,
+    repo_root: Path,
+    *,
+    universe,
+    outputs: dict[str, str],
+    counts: dict[str, int],
+    warnings: list[str],
+    changed_only: bool,
+    budget: int,
+    focus_terms: tuple[str, ...],
+) -> Path:
+    git_state = _read_json_if_present(layout.latest_dir / "git_state.json")
+    budget_report = _read_json_if_present(layout.latest_dir / "budget_report.json")
+    omissions = _read_json_if_present(layout.latest_dir / "omissions.json")
+    symbols = _read_json_if_present(layout.latest_dir / "symbol_index.json")
+    imports = _read_json_if_present(layout.latest_dir / "import_graph.json")
+    cli_inventory = _read_json_if_present(layout.latest_dir / "cli_inventory.json")
+    tests = _read_json_if_present(layout.latest_dir / "test_inventory.json")
+
+    git_payload = git_state.get("git", {}) if isinstance(git_state.get("git"), dict) else {}
+    omission_counts = omissions.get("counts", {}) if isinstance(omissions.get("counts"), dict) else {}
+    budget_counts = budget_report.get("counts", {}) if isinstance(budget_report.get("counts"), dict) else {}
+
+    lines: list[str] = [
+        "# Repository Snapshot",
+        "",
+        "## Generation Metadata",
+        "",
+        f"- Scope: `{'changed' if changed_only else 'full'}`",
+        f"- Requested budget tokens: {budget}",
+        f"- Focus terms: {list(focus_terms)}",
+        f"- Output directory: `.codecontext/latest/`",
+        "",
+        "## Repository Identity",
+        "",
+        f"- Repository name: `{repo_root.name}`",
+        "- Repository root is redacted from AI-facing Markdown by default.",
+        "",
+        "## Git State",
+        "",
+        f"- Git available: {git_payload.get('available')}",
+        f"- Git repository: {git_payload.get('is_repo')}",
+        f"- Branch: `{git_payload.get('branch') or '(none)'}`",
+        f"- Head: `{git_payload.get('head') or '(none)'}`",
+        f"- Dirty: {git_payload.get('is_dirty')}",
+        f"- Staged: {git_payload.get('staged_count', 0)}",
+        f"- Unstaged: {git_payload.get('unstaged_count', 0)}",
+        f"- Untracked: {git_payload.get('untracked_count', 0)}",
+        "",
+        "## Project Markers",
+        "",
+    ]
+
+    markers = _project_markers(repo_root)
+    lines.extend(f"- `{marker}`" for marker in markers)
+    if not markers:
+        lines.append("- No standard project markers detected.")
+
+    lines.extend(
+        [
+            "",
+            "## File Universe Summary",
+            "",
+        ]
+    )
+    universe_counts = getattr(universe, "counts", {})
+    if isinstance(universe_counts, dict):
+        for key in sorted(universe_counts):
+            lines.append(f"- {key}: {universe_counts[key]}")
+    else:
+        lines.append("- File-universe counts unavailable.")
+
+    lines.extend(
+        [
+            "",
+            "## Top-Level Tree",
+            "",
+            _read_text_excerpt(layout.latest_dir / "repo_tree.txt", max_lines=80),
+            "",
+            "## Language/Extension Summary",
+            "",
+        ]
+    )
+    extension_lines = _extension_summary(universe)
+    lines.extend(extension_lines or ["- No extension summary available."])
+
+    lines.extend(
+        [
+            "",
+            "## Python Package Summary",
+            "",
+            f"- Python files analyzed: {counts.get('python_files_analyzed', 0)}",
+            f"- Symbols: {counts.get('symbols', 0)}",
+            f"- Imports: {counts.get('imports', 0)}",
+            f"- Routes: {counts.get('routes', 0)}",
+            f"- CLI commands: {counts.get('commands', 0)}",
+            f"- Test files: {counts.get('test_files', 0)}",
+            f"- Test functions: {counts.get('test_functions', 0)}",
+            "",
+            "## Important Symbols",
+            "",
+        ]
+    )
+
+    symbol_records = symbols.get("symbols", [])
+    if isinstance(symbol_records, list) and symbol_records:
+        for record in symbol_records[:30]:
+            if isinstance(record, dict):
+                name = record.get("qualified_name") or record.get("name") or "<unknown>"
+                path = record.get("path", "")
+                start = record.get("start_line", "?")
+                end = record.get("end_line", start)
+                kind = record.get("kind", "symbol")
+                lines.append(f"- `{name}` ({kind}) — `{path}:L{start}-L{end}`")
+    else:
+        lines.append("- No symbols emitted.")
+
+    lines.extend(["", "## CLI Inventory Summary", ""])
+    cli_counts = cli_inventory.get("counts", {}) if isinstance(cli_inventory.get("counts"), dict) else {}
+    if cli_counts:
+        for key in sorted(cli_counts):
+            lines.append(f"- {key}: {cli_counts[key]}")
+    else:
+        lines.append("- No CLI inventory counts emitted.")
+
+    lines.extend(["", "## Test Inventory Summary", ""])
+    test_counts = tests.get("counts", {}) if isinstance(tests.get("counts"), dict) else {}
+    if test_counts:
+        for key in sorted(test_counts):
+            lines.append(f"- {key}: {test_counts[key]}")
+    else:
+        lines.append("- No test inventory counts emitted.")
+
+    lines.extend(["", "## Import Graph Summary", ""])
+    import_counts = imports.get("counts", {}) if isinstance(imports.get("counts"), dict) else {}
+    if import_counts:
+        for key in sorted(import_counts):
+            lines.append(f"- {key}: {import_counts[key]}")
+    else:
+        lines.append("- No import graph counts emitted.")
+
+    lines.extend(
+        [
+            "",
+            "## Safety and Redaction Summary",
+            "",
+            f"- Redaction enabled: {getattr(getattr(universe, 'redaction', None), 'enabled', True)}",
+            f"- Redacted occurrences: {getattr(getattr(universe, 'redaction', None), 'redacted_occurrences_count', 0)}",
+            f"- Budget estimation method: `{budget_report.get('estimation_method', 'unknown')}`",
+            f"- Budget pressure: `{budget_report.get('budget_pressure', 'unknown')}`",
+            f"- Ranked files: {budget_counts.get('ranked_files', 0)}",
+            "",
+            "## Skipped/Omitted Files Summary",
+            "",
+        ]
+    )
+
+    if omission_counts:
+        for key in sorted(omission_counts):
+            lines.append(f"- {key}: {omission_counts[key]}")
+    else:
+        lines.append("- No omission counts emitted.")
+
+    if warnings:
+        lines.extend(["", "### Warnings", ""])
+        lines.extend(f"- {warning}" for warning in warnings[:80])
+
+    lines.extend(
+        [
+            "",
+            "## Suggested Follow-Up Commands",
+            "",
+            "- `python -m codebase_lens pack --issue \"describe task\" --budget 24000 --no-archive`",
+            "- `python -m codebase_lens diff --symbols --no-archive`",
+            "- `python -m codebase_lens graph --changed --depth 1 --limit 80 --no-archive`",
+            "- `python -m codebase_lens contract --no-archive`",
+            "",
+            "## Generated Outputs",
+            "",
+        ]
+    )
+
+    for key in sorted(outputs):
+        lines.append(f"- `{key}` → `{outputs[key]}`")
+
+    destination = layout.latest_dir / "repo_snapshot.md"
+    destination.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8", newline="\n")
+    return destination
 
 def _write_snapshot_index(
     layout: OutputLayout,
@@ -220,6 +449,9 @@ def write_snapshot_bundle(
 
     outputs["file_inventory_json"] = ".codecontext/latest/file_inventory.json"
     outputs["repo_tree_txt"] = ".codecontext/latest/repo_tree.txt"
+
+    _write_git_state_report(layout, root)
+    outputs["git_state_json"] = ".codecontext/latest/git_state.json"
 
     omissions_path = _write_omissions_report(layout, universe, changed_only=changed_only)
     outputs["omissions_json"] = ".codecontext/latest/omissions.json"
@@ -378,6 +610,19 @@ def write_snapshot_bundle(
         "evidence_graph_edges": evidence_graph.counts.get("edges", 0),
         "evidence_graph_unresolved_edges": evidence_graph.counts.get("unresolved_edges", 0),
     }
+
+    _write_repo_snapshot_markdown(
+        layout,
+        root,
+        universe=universe,
+        outputs=outputs,
+        counts=counts,
+        warnings=warnings,
+        changed_only=changed_only,
+        budget=budget,
+        focus_terms=focus_terms,
+    )
+    outputs["repo_snapshot_md"] = ".codecontext/latest/repo_snapshot.md"
 
     _write_snapshot_index(
         layout,

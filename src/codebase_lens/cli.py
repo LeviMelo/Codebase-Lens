@@ -60,6 +60,8 @@ from codebase_lens.reports.manifest import build_manifest, copy_latest_to_run, p
 from codebase_lens.reports.snapshot import write_snapshot_bundle
 from codebase_lens.reports.scanner_outputs import write_file_inventory, write_tree_report
 from codebase_lens.scanners.universe import discover_file_universe
+from codebase_lens.reports.contract import write_contract_audit_reports
+from codebase_lens.reports.diff import write_diff_reports
 
 
 def _add_global_options(parser: argparse.ArgumentParser) -> None:
@@ -1075,7 +1077,8 @@ def _run_contract(args: argparse.Namespace) -> int:
         payload = contract_result_payload(result)
 
         layout = prepare_output_layout(repo_root, args.out, archive=not args.no_archive)
-        contract_path = write_json_report(layout.latest_dir / "contract_report.json", payload)
+        contract_outputs = write_contract_audit_reports(layout, payload)
+        contract_path = layout.latest_dir / "contract_audit.json"
 
         manifest = build_manifest(
             **_base_manifest_args(
@@ -1084,7 +1087,7 @@ def _run_contract(args: argparse.Namespace) -> int:
                 "contract",
                 {
                     "manifest_json": ".codecontext/latest/manifest.json",
-                    "contract_report_json": ".codecontext/latest/contract_report.json",
+                    **contract_outputs,
                 },
             )
         )
@@ -1263,12 +1266,17 @@ def _run_diff(args: argparse.Namespace) -> int:
             payload["changed_symbols"] = changed_symbol_result_payload(symbol_result)
 
         layout = prepare_output_layout(repo_root, args.out, archive=not args.no_archive)
-        diff_path = write_json_report(layout.latest_dir / "diff.json", payload)
-
         outputs = {
             "manifest_json": ".codecontext/latest/manifest.json",
-            "diff_json": ".codecontext/latest/diff.json",
+            **write_diff_reports(
+                layout,
+                diff_result,
+                payload,
+                changed_symbols_payload=payload.get("changed_symbols") if args.symbols else None,
+                base=args.base,
+            ),
         }
+        diff_path = layout.latest_dir / "diff.json"
 
         manifest = build_manifest(
             **_base_manifest_args(
