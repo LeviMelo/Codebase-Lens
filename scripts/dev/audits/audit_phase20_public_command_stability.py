@@ -29,25 +29,22 @@ def main() -> int:
     for relative in [
         "src/codebase_lens/cli.py",
         "src/codebase_lens/contracts/command_surface.py",
+        "src/codebase_lens/core/audit_artifacts.py",
     ]:
         assert_parseable(relative)
 
     from codebase_lens.contracts.command_surface import (
         audit_command_surface,
-        write_command_surface_audit_report,
+        command_surface_result_payload,
     )
+    from codebase_lens.core.audit_artifacts import write_audit_report_pair
 
     result = audit_command_surface(include_help=True, include_external_pack=True)
+    payload = command_surface_result_payload(result)
+    stable_path, latest_path = write_audit_report_pair(ROOT, "command_surface_audit", payload)
 
-    latest = ROOT / ".codecontext" / "latest"
-    latest.mkdir(parents=True, exist_ok=True)
-    report_path = latest / "command_surface_audit.json"
-    write_command_surface_audit_report(report_path, result)
-
-    if not report_path.is_file():
-        fail("command_surface_audit.json was not written.")
-
-    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    if not stable_path.is_file() or not latest_path.is_file():
+        fail("command_surface_audit.json was not written to stable and latest locations.")
 
     if payload.get("schema", {}).get("name") != "cbl.command_surface_audit":
         fail("command surface audit report has wrong schema name.")
@@ -75,6 +72,8 @@ def main() -> int:
         fail(f"External --repo pack recursively scanned .codecontext: {external['scanned_codecontext_paths']}")
 
     print("PASS: Phase 20 public command stability audit passed.")
+    print(f"Stable audit report: {stable_path}")
+    print(f"Latest audit report: {latest_path}")
     return 0
 
 

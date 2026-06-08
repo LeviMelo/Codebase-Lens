@@ -28,22 +28,19 @@ def main() -> int:
     for relative in [
         "src/codebase_lens/contracts/fixture_matrix.py",
         "src/codebase_lens/contracts/command_surface.py",
+        "src/codebase_lens/core/audit_artifacts.py",
     ]:
         assert_parseable(relative)
 
     from codebase_lens.contracts.fixture_matrix import (
+        release_fixture_matrix_payload,
         run_release_fixture_matrix,
-        write_release_fixture_matrix_report,
     )
+    from codebase_lens.core.audit_artifacts import write_audit_report_pair
 
     result = run_release_fixture_matrix(include_git_fixture=True)
-
-    latest = ROOT / ".codecontext" / "latest"
-    latest.mkdir(parents=True, exist_ok=True)
-    report_path = latest / "fixture_matrix_audit.json"
-    write_release_fixture_matrix_report(report_path, result)
-
-    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    payload = release_fixture_matrix_payload(result)
+    stable_path, latest_path = write_audit_report_pair(ROOT, "fixture_matrix_audit", payload)
 
     if payload.get("schema", {}).get("name") != "cbl.release_fixture_matrix":
         fail("Fixture matrix report has wrong schema name.")
@@ -67,7 +64,12 @@ def main() -> int:
     if payload.get("counts", {}).get("passed", 0) < 5:
         fail(f"Too few fixture cases passed: {payload.get('counts')}")
 
+    if not stable_path.is_file() or not latest_path.is_file():
+        fail("Fixture matrix audit report was not written to stable and latest locations.")
+
     print("PASS: Phase 21 release fixture matrix audit passed.")
+    print(f"Stable audit report: {stable_path}")
+    print(f"Latest audit report: {latest_path}")
     return 0
 
 

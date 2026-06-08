@@ -89,6 +89,9 @@ def builtin_cbl_contract() -> dict[str, Any]:
             "scripts/dev/audits/audit_phase20_public_command_stability.py",
             "src/codebase_lens/contracts/fixture_matrix.py",
             "scripts/dev/audits/audit_phase21_release_fixture_matrix.py",
+            "src/codebase_lens/core/audit_artifacts.py",
+            "src/codebase_lens/contracts/release_safety.py",
+            "scripts/dev/audits/audit_phase22_release_safety.py",
 ],
         "required_symbols": [
             {
