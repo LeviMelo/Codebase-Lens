@@ -1,499 +1,15 @@
 from __future__ import annotations
 
-import json
-from collections import Counter
-from dataclasses import dataclass
+import ast
+import re
 from pathlib import Path
-from typing import Any
+from textwrap import dedent
 
-from codebase_lens.reports.json import write_json_report
-from codebase_lens.reports.manifest import OutputLayout
+ROOT = Path.cwd()
+PROJECTION = ROOT / "src" / "codebase_lens" / "reports" / "handoff_projection.py"
 
 
-@dataclass(frozen=True)
-class HandoffProjectionResult:
-    outputs: dict[str, str]
-    counts: dict[str, int]
-    warnings: tuple[str, ...]
-
-
-BUILTIN_OR_LOW_VALUE_CALLS = {
-    "abs",
-    "all",
-    "any",
-    "bool",
-    "dict",
-    "enumerate",
-    "float",
-    "int",
-    "isinstance",
-    "issubclass",
-    "len",
-    "list",
-    "max",
-    "min",
-    "open",
-    "print",
-    "range",
-    "repr",
-    "reversed",
-    "set",
-    "sorted",
-    "str",
-    "sum",
-    "tuple",
-    "zip",
-    "SystemExit",
-}
-
-LOW_VALUE_HELPER_NAMES = {
-    "fail",
-    "run_cbl",
-    "names_in_file",
-    "make_repo",
-    "assert_parseable",
-    "main",
-    "_as_dict",
-    "_as_list",
-    "_node_id",
-    "_node_path",
-    "_node_label",
-    "_bullet",
-}
-
-LOW_VALUE_ATTRIBUTE_SUFFIXES = {
-    ".append",
-    ".extend",
-    ".add",
-    ".update",
-    ".setdefault",
-    ".get",
-    ".items",
-    ".keys",
-    ".values",
-    ".read_text",
-    ".write_text",
-    ".splitlines",
-    ".rstrip",
-    ".strip",
-    ".replace",
-    ".join",
-    ".resolve",
-    ".startswith",
-    ".endswith",
-    ".lower",
-    ".upper",
-}
-
-DYNAMIC_DISPATCH_TERMS = {
-    "handler",
-    "getattr",
-    "setattr",
-    "delattr",
-    "hasattr",
-    "globals",
-    "locals",
-    "__import__",
-    "import_module",
-}
-
-EXTERNAL_LIBRARY_PREFIXES = {
-    "ast.",
-    "json.",
-    "os.",
-    "re.",
-    "subprocess.",
-    "sys.",
-    "Path.",
-    "pathlib.",
-}
-
-REPORTING_NAME_TERMS = {
-    "report",
-    "render",
-    "write",
-    "markdown",
-    "json",
-    "manifest",
-    "serializer",
-    "serialize",
-    "output",
-    "emit",
-}
-
-ANALYSIS_NAME_TERMS = {
-    "analyze",
-    "analysis",
-    "collect",
-    "extract",
-    "parse",
-    "parser",
-    "scan",
-    "scanner",
-    "query",
-    "graph",
-    "index",
-    "inventory",
-    "map",
-    "resolve",
-}
-
-CORE_NAME_TERMS = {
-    "model",
-    "schema",
-    "contract",
-    "config",
-    "constant",
-    "domain",
-    "entity",
-    "types",
-}
-
-IO_NAME_TERMS = {
-    "file",
-    "path",
-    "git",
-    "diff",
-    "status",
-    "ignore",
-    "hash",
-    "redact",
-    "safety",
-    "textio",
-    "cleanup",
-}
-
-
-@dataclass(frozen=True)
-class ProjectProfile:
-    source_prefixes: tuple[str, ...]
-    cli_paths: tuple[str, ...]
-
-
-def _read_json(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        return {}
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return {}
-    return value if isinstance(value, dict) else {}
-
-
-def _as_list(value: Any) -> list[Any]:
-    return value if isinstance(value, list) else []
-
-
-def _as_dict(value: Any) -> dict[str, Any]:
-    return value if isinstance(value, dict) else {}
-
-
-def _node_id(node: dict[str, Any]) -> str:
-    return str(node.get("id") or "")
-
-
-def _node_label(node: dict[str, Any]) -> str:
-    return str(node.get("label") or node.get("id") or "")
-
-
-def _node_path(node: dict[str, Any] | None) -> str:
-    if not isinstance(node, dict):
-        return ""
-    return str(node.get("path") or "")
-
-
-def _node_kind(node: dict[str, Any] | None) -> str:
-    if not isinstance(node, dict):
-        return ""
-    return str(node.get("kind") or "")
-
-
-def _node_data(node: dict[str, Any] | None) -> dict[str, Any]:
-    if not isinstance(node, dict):
-        return {}
-    return _as_dict(node.get("data"))
-
-
-def _node_location(node: dict[str, Any]) -> str:
-    path = node.get("path")
-    line_range = node.get("line_range")
-    if not path:
-        return ""
-
-    if isinstance(line_range, list) and len(line_range) == 2:
-        return f"{path}:L{line_range[0]}-L{line_range[1]}"
-
-    if isinstance(line_range, tuple) and len(line_range) == 2:
-        return f"{path}:L{line_range[0]}-L{line_range[1]}"
-
-    return str(path)
-
-
-def _edge_evidence(edge: dict[str, Any]) -> str:
-    evidence = edge.get("evidence")
-    if isinstance(evidence, list) and evidence:
-        return str(evidence[0])
-    if isinstance(evidence, tuple) and evidence:
-        return str(evidence[0])
-    return ""
-
-
-def _node_by_id(nodes: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    return {_node_id(node): node for node in nodes if isinstance(node, dict) and _node_id(node)}
-
-
-def _path_parts(path: str) -> tuple[str, ...]:
-    return tuple(part for part in path.replace("\\", "/").split("/") if part)
-
-
-def _is_test_path(path: str) -> bool:
-    parts = _path_parts(path)
-    name = parts[-1] if parts else ""
-    return "tests" in parts or name.startswith("test_") or name.endswith("_test.py")
-
-
-def _is_script_or_tooling_path(path: str) -> bool:
-    parts = _path_parts(path)
-    return bool(parts and parts[0] in {"scripts", "tools", "devtools", "bin"})
-
-
-def _is_low_value_path(path: str) -> bool:
-    return _is_test_path(path) or _is_script_or_tooling_path(path)
-
-
-def _infer_source_prefixes(nodes: list[dict[str, Any]]) -> tuple[str, ...]:
-    candidate_counts: Counter[str] = Counter()
-
-    for node in nodes:
-        if not isinstance(node, dict):
-            continue
-        path = _node_path(node)
-        if not path or not path.endswith(".py"):
-            continue
-        if _is_low_value_path(path):
-            continue
-
-        parts = _path_parts(path)
-        if len(parts) >= 3 and parts[0] == "src":
-            candidate_counts[f"src/{parts[1]}/"] += 1
-        elif len(parts) >= 2:
-            candidate_counts[f"{parts[0]}/"] += 1
-        elif len(parts) == 1:
-            candidate_counts[parts[0]] += 1
-
-    if not candidate_counts:
-        return ()
-
-    max_count = max(candidate_counts.values())
-    selected = [
-        prefix
-        for prefix, count in candidate_counts.items()
-        if count >= 2 or count == max_count
-    ]
-    return tuple(sorted(selected, key=lambda item: (-candidate_counts[item], item))[:8])
-
-
-def _infer_project_profile(nodes: list[dict[str, Any]]) -> ProjectProfile:
-    prefixes = _infer_source_prefixes(nodes)
-    cli_paths = sorted(
-        {
-            _node_path(node)
-            for node in nodes
-            if isinstance(node, dict)
-            and node.get("kind") == "cli_command"
-            and _node_path(node)
-        }
-    )
-    return ProjectProfile(source_prefixes=prefixes, cli_paths=tuple(cli_paths))
-
-
-def _is_product_path(path: str, profile: ProjectProfile) -> bool:
-    if not path:
-        return False
-    if _is_low_value_path(path):
-        return False
-    if not profile.source_prefixes:
-        return path.endswith(".py")
-    return any(path.startswith(prefix) for prefix in profile.source_prefixes)
-
-
-def _source_node(edge: dict[str, Any], nodes_by_id: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
-    return nodes_by_id.get(str(edge.get("source") or ""))
-
-
-def _target_node(edge: dict[str, Any], nodes_by_id: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
-    target = edge.get("target")
-    if not target:
-        return None
-    return nodes_by_id.get(str(target))
-
-
-def _display_node(node: dict[str, Any] | None, *, fallback: str = "") -> str:
-    if not isinstance(node, dict):
-        return fallback or "<unresolved>"
-
-    label = _node_label(node)
-    path = _node_path(node)
-    kind = _node_kind(node)
-
-    if path and kind == "symbol":
-        return f"{path}::{label}"
-    if path and kind == "file":
-        return path
-    if path and kind in {"cli_command", "route", "test"}:
-        return f"{label} @ {path}"
-
-    return label
-
-
-def _span(node: dict[str, Any]) -> int:
-    line_range = node.get("line_range")
-    if isinstance(line_range, list) and len(line_range) == 2:
-        try:
-            return max(0, int(line_range[1]) - int(line_range[0]) + 1)
-        except (TypeError, ValueError):
-            return 0
-    if isinstance(line_range, tuple) and len(line_range) == 2:
-        try:
-            return max(0, int(line_range[1]) - int(line_range[0]) + 1)
-        except (TypeError, ValueError):
-            return 0
-    return 0
-
-
-def _contains_any(text: str, terms: set[str]) -> bool:
-    lowered = text.lower()
-    return any(term in lowered for term in terms)
-
-
-def _path_role(path: str, profile: ProjectProfile) -> str:
-    if not path:
-        return "unknown"
-    if _is_test_path(path):
-        return "tests"
-    if _is_script_or_tooling_path(path):
-        return "scripts"
-    if path in profile.cli_paths:
-        return "cli_surface"
-
-    blob = path.lower()
-    if _contains_any(blob, REPORTING_NAME_TERMS):
-        return "reporting"
-    if _contains_any(blob, ANALYSIS_NAME_TERMS):
-        return "analysis"
-    if _contains_any(blob, CORE_NAME_TERMS):
-        return "model_or_core"
-    if _contains_any(blob, IO_NAME_TERMS):
-        return "io_or_safety"
-    return "product"
-
-
-def _symbol_role(node: dict[str, Any], profile: ProjectProfile) -> str:
-    path = _node_path(node)
-    label = _node_label(node)
-    data = _node_data(node)
-    blob = " ".join([path, label, str(data.get("signature", ""))]).lower()
-    path_role = _path_role(path, profile)
-
-    if path_role == "cli_surface":
-        return "cli_surface"
-    if _contains_any(blob, REPORTING_NAME_TERMS):
-        return "reporting"
-    if _contains_any(blob, ANALYSIS_NAME_TERMS):
-        return "analysis"
-    if _contains_any(blob, CORE_NAME_TERMS):
-        return "model_or_core"
-    if _contains_any(blob, IO_NAME_TERMS):
-        return "io_or_safety"
-    return path_role
-
-
-def _symbol_score(node: dict[str, Any], incoming: Counter[str], outgoing: Counter[str], profile: ProjectProfile) -> float:
-    node_id = _node_id(node)
-    label = _node_label(node)
-    path = _node_path(node)
-    span = _span(node)
-    connectivity = incoming[node_id] + outgoing[node_id]
-    role = _symbol_role(node, profile)
-
-    score = 0.0
-    score += min(connectivity, 80) * 2.0
-    score += min(span, 160) * 0.45
-
-    if role == "analysis":
-        score += 55.0
-    elif role == "reporting":
-        score += 50.0
-    elif role == "cli_surface":
-        score += 45.0
-    elif role == "io_or_safety":
-        score += 30.0
-    elif role == "model_or_core":
-        score += 25.0
-
-    if not label.startswith("_"):
-        score += 40.0
-
-    if label.startswith((
-        "write_",
-        "build_",
-        "collect_",
-        "query_",
-        "render_",
-        "discover_",
-        "evaluate_",
-        "load_",
-        "map_",
-        "parse_",
-        "scan_",
-        "analyze_",
-    )):
-        score += 45.0
-
-    if label in LOW_VALUE_HELPER_NAMES:
-        score -= 120.0
-
-    if label.startswith("_") and span <= 4:
-        score -= 60.0
-
-    if _is_low_value_path(path):
-        score -= 250.0
-
-    return score
-
-
-def _rank_product_symbols(nodes: list[dict[str, Any]], edges: list[dict[str, Any]], profile: ProjectProfile, *, limit: int) -> list[dict[str, Any]]:
-    incoming = Counter(str(edge.get("target")) for edge in edges if isinstance(edge, dict) and edge.get("target"))
-    outgoing = Counter(str(edge.get("source")) for edge in edges if isinstance(edge, dict) and edge.get("source"))
-
-    symbols = [
-        node
-        for node in nodes
-        if isinstance(node, dict)
-        and node.get("kind") == "symbol"
-        and _is_product_path(_node_path(node), profile)
-    ]
-
-    ranked = sorted(
-        symbols,
-        key=lambda node: (
-            -_symbol_score(node, incoming, outgoing, profile),
-            _node_path(node),
-            _node_label(node),
-        ),
-    )
-    return ranked[:limit]
-
-
-def _entrypoints(nodes: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
-    values = [
-        node
-        for node in nodes
-        if isinstance(node, dict) and node.get("kind") in {"cli_command", "route"}
-    ]
-    return sorted(values, key=lambda node: (str(node.get("kind")), str(node.get("label"))))[:limit]
-
-
+EDGE_FAMILY = r'''
 def _edge_family(edge: dict[str, Any], source: dict[str, Any] | None, target: dict[str, Any] | None, profile: ProjectProfile) -> str:
     kind = str(edge.get("kind") or "")
     source_role = _symbol_role(source, profile) if isinstance(source, dict) else "unknown"
@@ -523,8 +39,10 @@ def _edge_family(edge: dict[str, Any], source: dict[str, Any] | None, target: di
     if kind == "file_contains_symbol":
         return "declaration_context"
     return "other_product_flow"
+'''
 
 
+EDGE_SELECTION_REASON = r'''
 def _edge_selection_reason(edge: dict[str, Any], family: str) -> str:
     kind = str(edge.get("kind") or "")
 
@@ -547,8 +65,10 @@ def _edge_selection_reason(edge: dict[str, Any], family: str) -> str:
     if kind == "file_contains_symbol":
         return "fallback declaration context for a product symbol"
     return "high-scoring product dependency edge"
+'''
 
 
+EDGE_RELEVANCE_SCORE = r'''
 def _edge_relevance_score(edge: dict[str, Any], nodes_by_id: dict[str, dict[str, Any]], profile: ProjectProfile) -> float:
     kind = str(edge.get("kind") or "")
     source = _source_node(edge, nodes_by_id)
@@ -609,30 +129,10 @@ def _edge_relevance_score(edge: dict[str, Any], nodes_by_id: dict[str, dict[str,
         score += 35.0
 
     return score
+'''
 
 
-def _edge_payload(edge: dict[str, Any], nodes_by_id: dict[str, dict[str, Any]], profile: ProjectProfile) -> dict[str, Any]:
-    source = _source_node(edge, nodes_by_id)
-    target = _target_node(edge, nodes_by_id)
-    family = _edge_family(edge, source, target, profile)
-    score = _edge_relevance_score(edge, nodes_by_id, profile)
-
-    return {
-        "kind": edge.get("kind"),
-        "source": _display_node(source, fallback=str(edge.get("source") or "")),
-        "target": _display_node(target, fallback=str(edge.get("target") or edge.get("target_text") or "<unresolved>")),
-        "source_path": _node_path(source),
-        "target_path": _node_path(target),
-        "source_role": _symbol_role(source, profile) if isinstance(source, dict) else "unknown",
-        "target_role": _symbol_role(target, profile) if isinstance(target, dict) else "unknown",
-        "confidence": edge.get("confidence"),
-        "evidence": _edge_evidence(edge),
-        "edge_family": family,
-        "selection_reason": _edge_selection_reason(edge, family),
-        "relevance_score": round(score, 3),
-    }
-
-
+REPRESENTATIVE_EDGES = r'''
 def _representative_edges(nodes: list[dict[str, Any]], edges: list[dict[str, Any]], profile: ProjectProfile, *, limit: int) -> list[dict[str, Any]]:
     nodes_by_id = _node_by_id(nodes)
 
@@ -748,26 +248,10 @@ def _representative_edges(nodes: list[dict[str, Any]], edges: list[dict[str, Any
         add(edge)
 
     return selected_edges[:limit]
+'''
 
 
-def _is_low_value_unresolved_call(target_text: str) -> bool:
-    if not target_text:
-        return True
-
-    leaf = target_text.rsplit(".", 1)[-1]
-
-    if target_text in BUILTIN_OR_LOW_VALUE_CALLS or leaf in BUILTIN_OR_LOW_VALUE_CALLS:
-        return True
-
-    if target_text in LOW_VALUE_HELPER_NAMES or leaf in LOW_VALUE_HELPER_NAMES:
-        return True
-
-    if any(target_text.endswith(suffix) for suffix in LOW_VALUE_ATTRIBUTE_SUFFIXES):
-        return True
-
-    return False
-
-
+CALL_CATEGORY = r'''
 def _call_category(target_text: str) -> str:
     leaf = target_text.rsplit(".", 1)[-1]
 
@@ -787,8 +271,10 @@ def _call_category(target_text: str) -> str:
         return "attribute_or_external"
 
     return "unclassified_product_call"
+'''
 
 
+UNRESOLVED_CALL_SCORE = r'''
 def _unresolved_call_score(edge: dict[str, Any], source: dict[str, Any] | None, profile: ProjectProfile) -> float:
     source_path = _node_path(source)
     source_label = _node_label(source) if source else ""
@@ -826,24 +312,10 @@ def _unresolved_call_score(edge: dict[str, Any], source: dict[str, Any] | None, 
         score -= 100.0
 
     return score
+'''
 
 
-def _unresolved_call_payload(edge: dict[str, Any], nodes_by_id: dict[str, dict[str, Any]], profile: ProjectProfile) -> dict[str, Any]:
-    source = _source_node(edge, nodes_by_id)
-    target_text = str(edge.get("target_text") or "")
-    category = _call_category(target_text)
-    return {
-        "source": _display_node(source, fallback=str(edge.get("source") or "")),
-        "source_path": _node_path(source),
-        "source_role": _symbol_role(source, profile) if isinstance(source, dict) else "unknown",
-        "target_text": target_text,
-        "call_category": category,
-        "confidence": edge.get("confidence"),
-        "evidence": _edge_evidence(edge),
-        "relevance_score": round(_unresolved_call_score(edge, source, profile), 3),
-    }
-
-
+UNRESOLVED_CALL_GROUPS = r'''
 def _unresolved_call_groups(nodes: list[dict[str, Any]], edges: list[dict[str, Any]], profile: ProjectProfile, *, limit: int) -> dict[str, Any]:
     nodes_by_id = _node_by_id(nodes)
 
@@ -915,115 +387,10 @@ def _unresolved_call_groups(nodes: list[dict[str, Any]], edges: list[dict[str, A
         "omitted_low_value_unresolved_call_count": omitted_low_value_count,
         "omitted_repetitive_reflection_count": omitted_repetitive_reflection_count,
     }
+'''
 
 
-def _changed_records(layout: OutputLayout, *, limit: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    changed_files = _as_list(_read_json(layout.latest_dir / "changed_files.json").get("changed_files"))
-    changed_symbols = _as_list(_read_json(layout.latest_dir / "changed_symbols.json").get("changed_symbols"))
-
-    files = [item for item in changed_files if isinstance(item, dict)][:limit]
-    symbols = [item for item in changed_symbols if isinstance(item, dict)][:limit]
-    return files, symbols
-
-
-def _projection_payload(
-    layout: OutputLayout,
-    *,
-    issue: str | None,
-    changed_only: bool,
-    budget: int,
-    focus_terms: tuple[str, ...],
-    counts: dict[str, int],
-    warnings: tuple[str, ...],
-) -> dict[str, Any]:
-    graph = _read_json(layout.latest_dir / "evidence_graph.json")
-    graph_counts = _as_dict(graph.get("counts"))
-    nodes = [node for node in _as_list(graph.get("nodes")) if isinstance(node, dict)]
-    edges = [edge for edge in _as_list(graph.get("edges")) if isinstance(edge, dict)]
-    profile = _infer_project_profile(nodes)
-    budget_report = _read_json(layout.latest_dir / "budget_report.json")
-    changed_files, changed_symbols = _changed_records(layout, limit=20)
-
-    node_kinds = Counter(str(node.get("kind")) for node in nodes)
-    edge_kinds = Counter(str(edge.get("kind")) for edge in edges)
-    unresolved_groups = _unresolved_call_groups(nodes, edges, profile, limit=16)
-
-    return {
-        "schema": {
-            "name": "cbl.handoff_projection",
-            "version": 3,
-        },
-        "issue": issue,
-        "scope": "changed" if changed_only else "full",
-        "project_profile": {
-            "source_prefixes": list(profile.source_prefixes),
-            "cli_paths": list(profile.cli_paths),
-        },
-        "budget": {
-            "requested_budget_tokens": budget,
-            "budget_pressure": budget_report.get("budget_pressure"),
-            "focus_terms": list(focus_terms),
-            "estimation_method": budget_report.get("estimation_method"),
-        },
-        "counts": {
-            **counts,
-            "evidence_graph_nodes": graph_counts.get("nodes", counts.get("evidence_graph_nodes", 0)),
-            "evidence_graph_edges": graph_counts.get("edges", counts.get("evidence_graph_edges", 0)),
-            "evidence_graph_unresolved_edges": graph_counts.get("unresolved_edges", counts.get("evidence_graph_unresolved_edges", 0)),
-        },
-        "graph": {
-            "node_kinds": dict(sorted(node_kinds.items())),
-            "edge_kinds": dict(sorted(edge_kinds.items())),
-            "high_connectivity_product_symbols": [
-                {
-                    "label": node.get("label"),
-                    "kind": node.get("kind"),
-                    "location": _node_location(node),
-                    "display": _display_node(node),
-                    "role": _symbol_role(node, profile),
-                    "signature": _node_data(node).get("signature"),
-                }
-                for node in _rank_product_symbols(nodes, edges, profile, limit=12)
-            ],
-            "entrypoints": [
-                {
-                    "label": node.get("label"),
-                    "kind": node.get("kind"),
-                    "location": _node_location(node),
-                    "display": _display_node(node),
-                    "data": _node_data(node),
-                }
-                for node in _entrypoints(nodes, limit=18)
-            ],
-            "representative_edges": _representative_edges(nodes, edges, profile, limit=20),
-            "unresolved_static_calls": unresolved_groups["dynamic_or_dispatch_calls"],
-            **unresolved_groups,
-        },
-        "changed_scope": {
-            "changed_only": changed_only,
-            "changed_files": changed_files,
-            "changed_symbols": changed_symbols,
-            "empty_changed_scope": bool(changed_only and not changed_files and not changed_symbols),
-        },
-        "sidecar_artifacts": {
-            "legacy_ai_handoff_md": ".codecontext/latest/ai_handoff.md",
-            "handoff_projection_md": ".codecontext/latest/handoff_projection.md",
-            "handoff_projection_json": ".codecontext/latest/handoff_projection.json",
-            "evidence_graph_json": ".codecontext/latest/evidence_graph.json",
-            "graph_summary_md": ".codecontext/latest/graph_summary.md",
-            "symbol_graph_json": ".codecontext/latest/symbol_graph.json",
-            "symbol_graph_md": ".codecontext/latest/symbol_graph.md",
-            "call_graph_json": ".codecontext/latest/call_graph.json",
-            "module_graph_json": ".codecontext/latest/module_graph.json",
-        },
-        "warnings": list(warnings),
-    }
-
-
-def _bullet(text: str) -> str:
-    return f"- {text}"
-
-
+RENDER_PROJECTION_MARKDOWN = r'''
 def _render_projection_markdown(payload: dict[str, Any]) -> str:
     budget = _as_dict(payload.get("budget"))
     counts = _as_dict(payload.get("counts"))
@@ -1225,36 +592,321 @@ def _render_projection_markdown(payload: dict[str, Any]) -> str:
             lines.append(_bullet(f"... {len(warnings) - 20} additional warnings omitted."))
 
     return "\n".join(lines).rstrip() + "\n"
+'''
 
 
-def write_handoff_projection_reports(
-    layout: OutputLayout,
-    *,
-    issue: str | None,
-    changed_only: bool,
-    budget: int,
-    focus_terms: tuple[str, ...],
-    counts: dict[str, int],
-    warnings: tuple[str, ...],
-) -> dict[str, str]:
-    payload = _projection_payload(
-        layout,
-        issue=issue,
-        changed_only=changed_only,
-        budget=budget,
-        focus_terms=focus_terms,
-        counts=counts,
-        warnings=warnings,
+AUDIT = r'''
+from __future__ import annotations
+
+import ast
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path.cwd()
+SRC = ROOT / "src"
+
+
+def fail(message: str) -> None:
+    print(f"FAIL: {message}")
+    raise SystemExit(1)
+
+
+def run_cbl(*args: str) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(SRC)
+    return subprocess.run(
+        [sys.executable, "-m", "codebase_lens", *args],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
     )
 
-    write_json_report(layout.latest_dir / "handoff_projection.json", payload)
-    (layout.latest_dir / "handoff_projection.md").write_text(
-        _render_projection_markdown(payload),
-        encoding="utf-8",
-        newline="\n",
+
+def assert_parseable(relative: str) -> None:
+    path = ROOT / relative
+    try:
+        ast.parse(path.read_text(encoding="utf-8"))
+    except SyntaxError as exc:
+        fail(f"{relative} is not parseable: {exc}")
+
+
+def section(text: str, heading: str) -> str:
+    marker = f"## {heading}"
+    start = text.find(marker)
+    if start == -1:
+        fail(f"Missing section: {heading}")
+    next_start = text.find("\n## ", start + len(marker))
+    if next_start == -1:
+        return text[start:]
+    return text[start:next_start]
+
+
+def main() -> int:
+    for relative in [
+        "src/codebase_lens/reports/handoff_projection.py",
+        "src/codebase_lens/reports/handoff.py",
+        "src/codebase_lens/cli.py",
+    ]:
+        assert_parseable(relative)
+
+    result = run_cbl("pack", "--issue", "phase 17 projection noise audit", "--budget", "24000", "--no-archive")
+    if result.returncode != 0:
+        fail(f"cbl pack failed:\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}")
+
+    latest = ROOT / ".codecontext" / "latest"
+    text = (latest / "handoff_projection.md").read_text(encoding="utf-8")
+    payload = json.loads((latest / "handoff_projection.json").read_text(encoding="utf-8"))
+
+    representative = section(text, "Representative Dependency Edges")
+    unresolved = section(text, "Dynamic / Unresolved Calls")
+
+    if "pathlib" in representative:
+        fail("Representative edges still surface stdlib pathlib import.")
+    if "`file_imports_module`: `src/" in representative and "target_path\": \"\"" in json.dumps(payload.get("graph", {}).get("representative_edges", [])):
+        fail("Representative edges include unresolved/external imports as first-class dependencies.")
+
+    graph = payload.get("graph", {})
+    edges = graph.get("representative_edges", [])
+    if not edges:
+        fail("No representative edges were emitted.")
+
+    for edge in edges:
+        if edge.get("kind") in {"file_imports_module", "module_resolves_to_file"} and not edge.get("target_path"):
+            fail(f"External/unresolved import selected as representative edge: {edge}")
+        if edge.get("edge_family") == "external_import_dependency":
+            fail(f"External import dependency should be fallback-only and absent in this repo: {edge}")
+
+    if "actual_dispatch_calls" not in graph:
+        fail("Projection JSON missing actual_dispatch_calls.")
+    if "reflective_attribute_reads" not in graph:
+        fail("Projection JSON missing reflective_attribute_reads.")
+    if "omitted_repetitive_reflection_count" not in graph:
+        fail("Projection JSON missing omitted_repetitive_reflection_count.")
+
+    dynamic = graph.get("dynamic_or_dispatch_calls", [])
+    actual = graph.get("actual_dispatch_calls", [])
+    reflective = graph.get("reflective_attribute_reads", [])
+
+    if dynamic != actual:
+        fail("dynamic_or_dispatch_calls should be a compatibility alias for actual_dispatch_calls.")
+
+    for item in actual:
+        if item.get("target_text") in {"getattr", "hasattr", "setattr", "delattr"}:
+            fail(f"Reflective call leaked into actual dispatch calls: {item}")
+
+    if len(reflective) > 3:
+        fail("Reflective attribute reads are not capped.")
+
+    if graph.get("omitted_repetitive_reflection_count", 0) < 1:
+        fail("Repetitive reflective reads were not counted as omitted.")
+
+    if "Reflective attribute reads" not in unresolved:
+        fail("Markdown does not summarize capped reflective attribute reads.")
+    if unresolved.count("getattr") > 3:
+        fail("Markdown still over-displays repeated getattr calls.")
+
+    print("PASS: Phase 17 projection noise audit passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
+
+TEST = r'''
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+
+
+def run_cbl(*args: str) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(SRC)
+    return subprocess.run(
+        [sys.executable, "-m", "codebase_lens", *args],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
     )
 
-    return {
-        "handoff_projection_json": ".codecontext/latest/handoff_projection.json",
-        "handoff_projection_md": ".codecontext/latest/handoff_projection.md",
+
+def test_projection_suppresses_external_import_and_repetitive_reflection_noise() -> None:
+    result = run_cbl("pack", "--issue", "projection noise suppression test", "--budget", "24000", "--no-archive")
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    latest = ROOT / ".codecontext" / "latest"
+    text = (latest / "handoff_projection.md").read_text(encoding="utf-8")
+    payload = json.loads((latest / "handoff_projection.json").read_text(encoding="utf-8"))
+
+    representative = text[text.index("## Representative Dependency Edges"):text.index("## Dynamic / Unresolved Calls")]
+    unresolved = text[text.index("## Dynamic / Unresolved Calls"):text.index("## Changed Scope")]
+    graph = payload["graph"]
+
+    assert "pathlib" not in representative
+
+    for edge in graph["representative_edges"]:
+        if edge["kind"] in {"file_imports_module", "module_resolves_to_file"}:
+            assert edge["target_path"], edge
+        assert edge["edge_family"] != "external_import_dependency"
+
+    assert "actual_dispatch_calls" in graph
+    assert "reflective_attribute_reads" in graph
+    assert "omitted_repetitive_reflection_count" in graph
+    assert graph["dynamic_or_dispatch_calls"] == graph["actual_dispatch_calls"]
+
+    for item in graph["actual_dispatch_calls"]:
+        assert item["target_text"] not in {"getattr", "hasattr", "setattr", "delattr"}
+
+    assert len(graph["reflective_attribute_reads"]) <= 3
+    assert graph["omitted_repetitive_reflection_count"] >= 1
+
+    assert "Reflective attribute reads" in unresolved
+    assert unresolved.count("getattr") <= 3
+'''
+
+
+def normalize(content: str) -> str:
+    return dedent(content).strip("\n") + "\n"
+
+
+def replace_function(source: str, function_name: str, replacement: str) -> str:
+    tree = ast.parse(source)
+    matches = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == function_name
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(f"Expected exactly one function named {function_name}, found {len(matches)}.")
+
+    node = matches[0]
+    if node.end_lineno is None:
+        raise RuntimeError(f"AST node for {function_name} has no end_lineno.")
+
+    lines = source.splitlines()
+    new_lines = lines[: node.lineno - 1] + normalize(replacement).splitlines() + lines[node.end_lineno :]
+    return "\n".join(new_lines).rstrip() + "\n"
+
+
+def write_file(relative: str, content: str, modified: set[Path]) -> None:
+    path = ROOT / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(normalize(content), encoding="utf-8", newline="\n")
+    if path.suffix == ".py":
+        modified.add(path)
+
+
+def list_bounds_for_key(text: str, key: str) -> tuple[int, int]:
+    match = re.search(rf'(?P<quote>["\']){re.escape(key)}(?P=quote)\s*:\s*\[', text)
+    if not match:
+        raise RuntimeError(f"Could not find list key {key!r}.")
+
+    open_index = text.find("[", match.start())
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    i = open_index
+
+    while i < len(text):
+        ch = text[i]
+
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == quote:
+                quote = None
+            i += 1
+            continue
+
+        if ch in {"'", '"'}:
+            quote = ch
+        elif ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                return open_index, i
+
+        i += 1
+
+    raise RuntimeError(f"Could not find closing bracket for {key!r}.")
+
+
+def insert_before_list_close(text: str, key: str, block: str) -> str:
+    _, close = list_bounds_for_key(text, key)
+    return text[:close] + block + text[close:]
+
+
+def patch_contract(modified: set[Path]) -> None:
+    path = ROOT / "src" / "codebase_lens" / "contracts" / "architecture.py"
+    text = path.read_text(encoding="utf-8")
+
+    required_file = "scripts/dev/audits/audit_phase17_projection_noise.py"
+    if f'"{required_file}"' not in text and f"'{required_file}'" not in text:
+        text = insert_before_list_close(text, "required_files", f'            "{required_file}",\n')
+
+    path.write_text(text, encoding="utf-8", newline="\n")
+    modified.add(path)
+
+
+def assert_parseable(paths: set[Path]) -> None:
+    for path in sorted(paths):
+        if path.suffix != ".py":
+            continue
+        try:
+            ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError as exc:
+            raise RuntimeError(f"Generated invalid Python in {path}: {exc}") from exc
+
+
+def main() -> int:
+    modified: set[Path] = set()
+
+    source = PROJECTION.read_text(encoding="utf-8")
+    replacements = {
+        "_edge_family": EDGE_FAMILY,
+        "_edge_selection_reason": EDGE_SELECTION_REASON,
+        "_edge_relevance_score": EDGE_RELEVANCE_SCORE,
+        "_representative_edges": REPRESENTATIVE_EDGES,
+        "_call_category": CALL_CATEGORY,
+        "_unresolved_call_score": UNRESOLVED_CALL_SCORE,
+        "_unresolved_call_groups": UNRESOLVED_CALL_GROUPS,
+        "_render_projection_markdown": RENDER_PROJECTION_MARKDOWN,
     }
+
+    for function_name, replacement in replacements.items():
+        source = replace_function(source, function_name, replacement)
+
+    PROJECTION.write_text(source, encoding="utf-8", newline="\n")
+    modified.add(PROJECTION)
+
+    write_file("scripts/dev/audits/audit_phase17_projection_noise.py", AUDIT, modified)
+    write_file("tests/test_handoff_projection_noise.py", TEST, modified)
+    patch_contract(modified)
+
+    assert_parseable(modified)
+
+    print("Slice 015F applied: projection noise suppressed for external imports and repetitive reflection.")
+    print("The updater parsed every modified Python file before exiting.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
