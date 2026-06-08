@@ -104,6 +104,7 @@ def builtin_cbl_contract() -> dict[str, Any]:
             "scripts/dev/audits/audit_phase25_report_contract_parity.py",
             "docs/V0_1_RELEASE_STATUS.md",
             "scripts/dev/audits/audit_phase26_v01_release_closure.py",
+            "scripts/dev/audits/audit_phase27_reliability_corrections.py",
 ],
         "required_symbols": [
             {
@@ -245,6 +246,20 @@ def builtin_cbl_contract() -> dict[str, Any]:
                 "symbols": [
                     "render_contract_audit_markdown",
                     "write_contract_audit_reports",
+                ],
+            },
+            {
+                "path": "src/codebase_lens/core/redaction.py",
+                "symbols": [
+                    "redact_jsonable",
+                    "redact_string",
+                ],
+            },
+            {
+                "path": "src/codebase_lens/analyzers/tests.py",
+                "symbols": [
+                    "classify_test_path",
+                    "TestLikeSymbolRecord",
                 ],
             },
 ],

@@ -81,9 +81,11 @@ def changed_files_payload(result: ChangedFileSet) -> dict[str, Any]:
 
 
 def test_inventory_payload(result: TestInventoryResult) -> dict[str, Any]:
+    test_like_symbols = tuple(getattr(result, "test_like_symbols", ()))
     return {
         "tests": [asdict(record) for record in result.tests],
         "fixtures": [asdict(record) for record in result.fixtures],
+        "test_like_symbols": [asdict(record) for record in test_like_symbols],
         "syntax_errors": list(result.syntax_errors),
         "warnings": list(result.warnings),
         "counts": {
@@ -91,6 +93,7 @@ def test_inventory_payload(result: TestInventoryResult) -> dict[str, Any]:
             "test_functions": sum(len(record.test_functions) for record in result.tests),
             "test_classes": sum(len(record.test_classes) for record in result.tests),
             "fixtures": len(result.fixtures),
+            "test_like_symbols": len(test_like_symbols),
         },
     }
 

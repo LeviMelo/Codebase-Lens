@@ -26,6 +26,10 @@ class FileUniverseResult:
     redaction: RedactionStats
     warnings: tuple[str, ...]
 
+    @property
+    def omissions(self) -> tuple[OmissionRecord, ...]:
+        return self.omitted_files
+
     def manifest_counts(self) -> dict[str, int]:
         return {
             "tracked_included_count": self.counts.get("tracked_included_count", 0),

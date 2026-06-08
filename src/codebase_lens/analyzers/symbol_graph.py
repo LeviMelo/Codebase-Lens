@@ -172,27 +172,62 @@ def _call_name(node: ast.Call) -> str | None:
     return _unparse(func)
 
 
+def _iter_child_nodes_without_nested_definitions(node: ast.AST):
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        yield child
+        yield from _iter_child_nodes_without_nested_definitions(child)
+
+
 def _calls_for(node: ast.AST) -> tuple[CallEdge, ...]:
     values: list[CallEdge] = []
-    for child in ast.walk(node):
-        if isinstance(child, ast.Call):
-            name = _call_name(child)
-            if not name:
-                continue
-            confidence = "medium" if "." in name else "high"
-            values.append(CallEdge(name=name, line=getattr(child, "lineno", 0), confidence=confidence))
+    seen: set[tuple[str, int, str]] = set()
+
+    if isinstance(node, ast.ClassDef):
+        scan_roots: list[ast.AST] = [*node.decorator_list, *node.bases, *node.keywords]
+        scan_roots.extend(item for item in node.body if not isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)))
+    elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        scan_roots = [*node.decorator_list, *node.args.defaults, *node.args.kw_defaults]
+        if node.returns is not None:
+            scan_roots.append(node.returns)
+        scan_roots.extend(node.body)
+    else:
+        scan_roots = [node]
+
+    for root in scan_roots:
+        if root is None:
+            continue
+        candidates = [root]
+        candidates.extend(_iter_child_nodes_without_nested_definitions(root))
+        for child in candidates:
+            if isinstance(child, ast.Call):
+                name = _call_name(child)
+                if not name:
+                    continue
+                confidence = "medium" if "." in name else "high"
+                key = (name, int(getattr(child, "lineno", 0)), confidence)
+                if key in seen:
+                    continue
+                seen.add(key)
+                values.append(CallEdge(name=name, line=key[1], confidence=confidence))
+
     return tuple(values)
 
 
 def _returns_for(node: ast.AST) -> tuple[ReturnObservation, ...]:
     values: list[ReturnObservation] = []
-    for child in ast.walk(node):
+    seen: set[tuple[int, str]] = set()
+
+    for child in _iter_child_nodes_without_nested_definitions(node):
         if isinstance(child, ast.Return):
             expression = _unparse(child.value) if child.value is not None else "None"
-            values.append(ReturnObservation(line=getattr(child, "lineno", 0), expression=(expression or "<unparseable>")[:300]))
+            item = ReturnObservation(line=getattr(child, "lineno", 0), expression=(expression or "<unparseable>")[:300])
+            key = (item.line, item.expression)
+            if key not in seen:
+                seen.add(key)
+                values.append(item)
     return tuple(values)
-
-
 def _imports_for(tree: ast.Module) -> dict[str, str]:
     values: dict[str, str] = {}
     for node in ast.walk(tree):
@@ -222,13 +257,41 @@ def _symbol_id(path: str, qualified_name: str, start_line: int, end_line: int) -
     return f"{path}:{qualified_name}:L{start_line}-L{end_line}"
 
 
+def _iter_control_flow_bodies(node: ast.AST) -> tuple[list[ast.stmt], ...]:
+    bodies: list[list[ast.stmt]] = []
+    for attr in ("body", "orelse", "finalbody"):
+        value = getattr(node, attr, None)
+        if isinstance(value, list):
+            bodies.append(value)
+    handlers = getattr(node, "handlers", None)
+    if isinstance(handlers, list):
+        for handler in handlers:
+            value = getattr(handler, "body", None)
+            if isinstance(value, list):
+                bodies.append(value)
+    cases = getattr(node, "cases", None)
+    if isinstance(cases, list):
+        for case in cases:
+            value = getattr(case, "body", None)
+            if isinstance(value, list):
+                bodies.append(value)
+    return tuple(bodies)
+
+
+def _function_kind(parent_stack: tuple[tuple[str, str], ...], node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+    if parent_stack and parent_stack[-1][1] == "class":
+        return "async_method" if isinstance(node, ast.AsyncFunctionDef) else "method"
+    return "async_function" if isinstance(node, ast.AsyncFunctionDef) else "function"
+
+
 def _iter_symbols(tree: ast.Module, path: str, lines: list[str]) -> tuple[_RawSymbol, ...]:
     imported_names = _imports_for(tree)
     symbols: list[_RawSymbol] = []
 
-    def visit_body(body: list[ast.stmt], prefix: tuple[str, ...]) -> None:
+    def visit_body(body: list[ast.stmt], stack: tuple[tuple[str, str], ...]) -> None:
         for item in body:
             if isinstance(item, ast.ClassDef):
+                prefix = tuple(name for name, _kind in stack)
                 qualified = ".".join((*prefix, item.name))
                 symbols.append(
                     _RawSymbol(
@@ -246,15 +309,18 @@ def _iter_symbols(tree: ast.Module, path: str, lines: list[str]) -> tuple[_RawSy
                         imported_names=imported_names,
                     )
                 )
-                visit_body(item.body, (*prefix, item.name))
+                visit_body(item.body, (*stack, (item.name, "class")))
+                continue
 
-            elif isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                prefix = tuple(name for name, _kind in stack)
                 qualified = ".".join((*prefix, item.name))
+                kind = _function_kind(stack, item)
                 symbols.append(
                     _RawSymbol(
                         qualified_name=qualified,
                         simple_name=item.name,
-                        kind="async_function" if isinstance(item, ast.AsyncFunctionDef) else "function",
+                        kind=kind,
                         path=path,
                         start_line=item.lineno,
                         end_line=getattr(item, "end_lineno", item.lineno),
@@ -266,13 +332,14 @@ def _iter_symbols(tree: ast.Module, path: str, lines: list[str]) -> tuple[_RawSy
                         imported_names=imported_names,
                     )
                 )
+                visit_body(item.body, (*stack, (item.name, kind)))
+                continue
 
-                visit_body(item.body, (*prefix, item.name))
+            for child_body in _iter_control_flow_bodies(item):
+                visit_body(child_body, stack)
 
     visit_body(tree.body, ())
     return tuple(symbols)
-
-
 def _likely_tests_for(raw: _RawSymbol, all_paths: tuple[str, ...]) -> tuple[str, ...]:
     simple = raw.simple_name.lower()
     module_stem = Path(raw.path).stem.lower()
@@ -313,39 +380,38 @@ def _resolve_call_targets(
 ) -> tuple[_RawSymbol, ...]:
     call_name = call.name
     base = call_name.split(".", 1)[0]
+    targets: list[_RawSymbol] = []
 
     if "." not in call_name:
         same_file = tuple(symbols_by_file_simple.get((source.path, call_name), ()))
         if same_file:
-            return tuple(target for target in same_file if target.qualified_name != source.qualified_name)
+            targets.extend(target for target in same_file if target.qualified_name != source.qualified_name)
+        else:
+            imported = source.imported_names.get(call_name)
+            if imported:
+                targets.extend(symbols_by_import_name.get(imported, ()))
 
-        imported = source.imported_names.get(call_name)
-        if imported:
-            return tuple(symbols_by_import_name.get(imported, ()))
-
-        return ()
-
-    if call_name.startswith(("self.", "cls.")):
+    elif call_name.startswith(("self.", "cls.")):
         method_name = call_name.split(".")[-1]
-        if "." not in source.qualified_name:
-            return ()
+        if "." in source.qualified_name:
+            owner = source.qualified_name.rsplit(".", 1)[0]
+            expected = f"{owner}.{method_name}"
+            targets.extend(
+                target
+                for target in symbols_by_file_simple.get((source.path, method_name), ())
+                if target.qualified_name == expected
+            )
 
-        owner = source.qualified_name.rsplit(".", 1)[0]
-        expected = f"{owner}.{method_name}"
-        return tuple(
-            target
-            for target in symbols_by_file_simple.get((source.path, method_name), ())
-            if target.qualified_name == expected
-        )
+    else:
+        imported = source.imported_names.get(base)
+        if imported:
+            suffix = call_name[len(base) :]
+            targets.extend(symbols_by_import_name.get(imported + suffix, ()))
 
-    imported = source.imported_names.get(base)
-    if imported:
-        suffix = call_name[len(base) :]
-        return tuple(symbols_by_import_name.get(imported + suffix, ()))
-
-    return ()
-
-
+    by_id: dict[str, _RawSymbol] = {}
+    for target in targets:
+        by_id[_symbol_id(target.path, target.qualified_name, target.start_line, target.end_line)] = target
+    return tuple(by_id.values())
 def collect_symbol_graph(
     repo_root: str | Path,
     python_files: list[str],
@@ -387,6 +453,7 @@ def collect_symbol_graph(
             symbols_by_import_name.setdefault(f"{module_name}.{target.qualified_name}", []).append(target)
 
     callers_by_target: dict[str, list[CallerEdge]] = {}
+    caller_seen: set[tuple[str, str, str, int, str]] = set()
     for source in raw_symbols:
         for call in source.calls:
             targets = _resolve_call_targets(
@@ -400,6 +467,10 @@ def collect_symbol_graph(
                     continue
 
                 target_id = _symbol_id(target.path, target.qualified_name, target.start_line, target.end_line)
+                key = (target_id, source.path, source.qualified_name, call.line, call.confidence)
+                if key in caller_seen:
+                    continue
+                caller_seen.add(key)
                 callers_by_target.setdefault(target_id, []).append(
                     CallerEdge(
                         symbol=source.qualified_name,
@@ -449,7 +520,7 @@ def collect_symbol_graph(
         nodes=tuple(nodes),
         counts={
             "nodes": len(nodes),
-            "functions": sum(1 for node in nodes if node.kind in {"function", "async_function"}),
+            "functions": sum(1 for node in nodes if node.kind in {"function", "async_function", "method", "async_method"}),
             "classes": sum(1 for node in nodes if node.kind == "class"),
             "call_edges": sum(len(node.calls) for node in nodes),
             "caller_edges": sum(len(node.called_by) for node in nodes),

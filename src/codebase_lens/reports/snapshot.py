@@ -30,6 +30,7 @@ from codebase_lens.reports.scanner_outputs import write_file_inventory, write_tr
 from codebase_lens.scanners.universe import discover_file_universe
 from codebase_lens.core.budget import build_budget_report_payload
 from codebase_lens.git.discover import collect_git_info
+from codebase_lens.core.redaction import redact_console_text
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,14 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_jsonable(item) for item in value]
     return value
+
+
+
+def _omitted_files(universe: object) -> tuple[object, ...]:
+    value = getattr(universe, "omitted_files", None)
+    if value is None:
+        value = getattr(universe, "omissions", ())
+    return tuple(value or ())
 
 
 def _python_files_from_universe(universe) -> list[str]:
@@ -103,16 +112,19 @@ def _focus_hits_for_path(path: str, focus_terms: tuple[str, ...]) -> int:
 
 
 def _write_omissions_report(layout: OutputLayout, universe, *, changed_only: bool) -> Path:
+    omitted_files = [_jsonable(record) for record in _omitted_files(universe)]
     payload = {
         "schema": {
             "name": "cbl.omissions",
-            "version": 1,
+            "version": 2,
         },
         "scope": "changed" if changed_only else "full",
-        "omissions": [_jsonable(record) for record in getattr(universe, "omissions", ())],
+        "omitted_files": omitted_files,
+        "omissions": omitted_files,
         "warnings": list(getattr(universe, "warnings", ())),
         "counts": {
-            "omissions": len(getattr(universe, "omissions", ())),
+            "omitted_files": len(omitted_files),
+            "omissions": len(omitted_files),
             "warnings": len(getattr(universe, "warnings", ())),
             "hard_excluded_count": getattr(universe, "counts", {}).get("hard_excluded_count", 0),
             "large_skipped_count": getattr(universe, "counts", {}).get("large_skipped_count", 0),
@@ -122,8 +134,6 @@ def _write_omissions_report(layout: OutputLayout, universe, *, changed_only: boo
         },
     }
     return write_json_report(layout.latest_dir / "omissions.json", payload)
-
-
 def _write_budget_report(
     layout: OutputLayout,
     universe,
@@ -399,7 +409,7 @@ def _write_repo_snapshot_markdown(
         lines.append(f"- `{key}` → `{outputs[key]}`")
 
     destination = layout.latest_dir / "repo_snapshot.md"
-    destination.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8", newline="\n")
+    destination.write_text(redact_console_text("\n".join(lines).rstrip() + "\n"), encoding="utf-8", newline="\n")
     return destination
 
 def _write_snapshot_index(
@@ -602,7 +612,7 @@ def write_snapshot_bundle(
         "fixtures": len(test_inventory.fixtures),
         "changed_files": changed_file_count,
         "changed_symbols": changed_symbol_count,
-        "omissions": len(getattr(universe, "omissions", ())),
+        "omissions": len(_omitted_files(universe)),
         "symbol_graph_nodes": graph_result.counts.get("nodes", 0),
         "symbol_graph_call_edges": graph_result.counts.get("call_edges", 0),
         "symbol_graph_caller_edges": graph_result.counts.get("caller_edges", 0),

@@ -37,6 +37,13 @@ def _render_node(node: dict[str, Any], lines: list[str], *, prefix: str, depth: 
         lines.append(f"{prefix}{filename}")
 
 
+def _omitted_files(result: object) -> tuple[object, ...]:
+    value = getattr(result, "omitted_files", None)
+    if value is None:
+        value = getattr(result, "omissions", ())
+    return tuple(value or ())
+
+
 def render_tree_report(
     result,
     *,
@@ -47,7 +54,7 @@ def render_tree_report(
     """Render a scanner FileUniverseResult as text without report-layer imports."""
 
     included_files = list(getattr(result, "included_files", ()))
-    omissions = list(getattr(result, "omissions", ()))
+    omitted_files = list(_omitted_files(result))
     counts = dict(getattr(result, "counts", {}))
 
     tree: dict[str, Any] = {}
@@ -86,14 +93,14 @@ def render_tree_report(
 
     if show_skipped:
         lines.extend(["", "Skipped/omitted files:"])
-        if not omissions:
+        if not omitted_files:
             lines.append("(none)")
         else:
-            for record in omissions:
+            for record in omitted_files:
                 path = getattr(record, "path", "")
                 reason = getattr(record, "reason", "unknown")
-                evidence = getattr(record, "evidence", None)
-                suffix = f" ({evidence})" if evidence else ""
+                category = getattr(record, "category", None)
+                suffix = f" ({category})" if category else ""
                 lines.append(f"{path}: {reason}{suffix}")
 
     return "\n".join(lines)

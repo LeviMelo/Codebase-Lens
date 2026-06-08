@@ -193,6 +193,7 @@ def build_parser() -> argparse.ArgumentParser:
     graph.add_argument("--depth", type=int, default=1, help="Undirected graph expansion depth from seed nodes.")
     graph.add_argument("--limit", type=int, default=60, help="Maximum nodes to retain in the markdown-oriented query view.")
     graph.add_argument("--changed", action="store_true", help="Seed query from changed hunks and changed symbols.")
+    graph.add_argument("--unresolved", choices=("seed", "selected", "none"), default="seed", help="Control unresolved call-name edges in graph query output.")
     graph.set_defaults(handler=_run_graph)
 
     return parser
@@ -959,6 +960,7 @@ def _run_graph(args: argparse.Namespace) -> int:
             changed=args.changed,
             depth=args.depth,
             limit=args.limit,
+            unresolved_mode=args.unresolved,
         )
 
         outputs = dict(snapshot_result.outputs)

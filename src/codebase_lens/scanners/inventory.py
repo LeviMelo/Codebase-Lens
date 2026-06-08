@@ -17,18 +17,26 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
+def _omitted_files(result: object) -> tuple[object, ...]:
+    value = getattr(result, "omitted_files", None)
+    if value is None:
+        value = getattr(result, "omissions", ())
+    return tuple(value or ())
+
+
 def file_universe_to_inventory(result) -> dict[str, Any]:
     """Convert a scanner FileUniverseResult into a serializable inventory payload.
 
-    This module intentionally does not write files and does not import report-layer
-    helpers. Scanner modules own file-universe semantics; report modules own output
-    persistence.
+    Scanner semantics use the canonical name ``omitted_files``. The legacy
+    ``omissions`` key remains in emitted JSON for one compatibility cycle.
     """
+
+    omitted = [_jsonable(record) for record in _omitted_files(result)]
 
     return {
         "schema": {
             "name": "cbl.file_inventory",
-            "version": 1,
+            "version": 2,
         },
         "repo": {
             "root": "<redacted>",
@@ -37,6 +45,7 @@ def file_universe_to_inventory(result) -> dict[str, Any]:
         "counts": dict(getattr(result, "counts", {})),
         "redaction": _jsonable(getattr(result, "redaction", None)),
         "files": [_jsonable(record) for record in getattr(result, "included_files", ())],
-        "omissions": [_jsonable(record) for record in getattr(result, "omissions", ())],
+        "omitted_files": omitted,
+        "omissions": omitted,
         "warnings": list(getattr(result, "warnings", ())),
     }

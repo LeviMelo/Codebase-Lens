@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from codebase_lens import TOOL_NAME, __version__
+from codebase_lens.core.redaction import redact_jsonable
 
 
 @dataclass(frozen=True)
@@ -75,12 +76,36 @@ def prepare_output_layout(
         run_dir=run_dir,
     )
 
+def _sanitize_argv(argv: list[str]) -> list[str]:
+    sanitized: list[str] = []
+    redact_next = False
+    value_options = {"--repo", "--out", "--spec"}
+    for item in argv:
+        if redact_next:
+            sanitized.append("<PATH_OR_SPEC_REDACTED>")
+            redact_next = False
+            continue
+        if item in value_options:
+            sanitized.append(item)
+            redact_next = True
+            continue
+        if item.startswith("--repo="):
+            sanitized.append("--repo=<PATH_OR_SPEC_REDACTED>")
+            continue
+        if item.startswith("--out="):
+            sanitized.append("--out=<PATH_OR_SPEC_REDACTED>")
+            continue
+        if item.startswith("--spec="):
+            sanitized.append("--spec=<PATH_OR_SPEC_REDACTED>")
+            continue
+        sanitized.append(str(redact_jsonable(item)))
+    return sanitized
 
 def write_json(path: str | Path, payload: dict[str, Any]) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(
-        json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+        json.dumps(redact_jsonable(payload), indent=2, sort_keys=True, ensure_ascii=False) + "\n",
         encoding="utf-8",
         newline="\n",
     )
@@ -128,7 +153,8 @@ def build_manifest(
         },
         "git": git,
         "command": {
-            "argv": argv,
+            "argv": _sanitize_argv(argv),
+            "argv_redacted_for_ai": True,
             "subcommand": subcommand,
             "budget": budget,
             "focus": focus,

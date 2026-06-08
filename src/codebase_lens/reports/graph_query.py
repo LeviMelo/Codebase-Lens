@@ -6,6 +6,7 @@ from typing import Any
 from codebase_lens.analyzers.graph_query import GraphQueryResult, graph_query_payload
 from codebase_lens.reports.json import write_json_report
 from codebase_lens.reports.manifest import OutputLayout
+from codebase_lens.core.redaction import redact_console_text
 
 
 def _node_location(node: dict[str, Any]) -> str:
@@ -124,6 +125,8 @@ def render_graph_query_markdown(result: GraphQueryResult) -> str:
         f"- Nodes: {result.counts.get('nodes', 0)}",
         f"- Edges: {result.counts.get('edges', 0)}",
         f"- Unresolved edges: {result.counts.get('unresolved_edges', 0)}",
+        f"- Omitted unresolved edges: {result.counts.get('omitted_unresolved_edges', 0)}",
+        f"- Omitted edges by total cap: {result.counts.get('omitted_edges_by_limit', 0)}",
         "",
         "## Node Kinds",
         "",
@@ -162,9 +165,9 @@ def render_graph_query_markdown(result: GraphQueryResult) -> str:
             "",
             "## Follow-Up Commands",
             "",
-            "- `cbl symbol --name <symbol> --context 80` for exact symbol source.",
-            "- `cbl file --path <path> --lines <start>:<end>` for exact line-range source.",
-            "- `cbl callers --name <symbol>` for legacy caller lookup.",
+            "- `cbl symbol <symbol> --context 80` for exact symbol source.",
+            "- `cbl file <path> --lines <start>:<end>` for exact line-range source.",
+            "- `cbl callers <symbol>` for legacy caller lookup.",
             "- `cbl graph --symbol <symbol> --depth 2` for a wider graph neighborhood.",
         ]
     )
@@ -175,7 +178,7 @@ def render_graph_query_markdown(result: GraphQueryResult) -> str:
 def write_graph_query_reports(layout: OutputLayout, result: GraphQueryResult) -> dict[str, str]:
     write_json_report(layout.latest_dir / "graph_query.json", graph_query_payload(result))
     (layout.latest_dir / "graph_query.md").write_text(
-        render_graph_query_markdown(result),
+        redact_console_text(render_graph_query_markdown(result)),
         encoding="utf-8",
         newline="\n",
     )

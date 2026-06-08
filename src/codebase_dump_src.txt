@@ -3106,6 +3106,8 @@ from codebase_lens.reports.manifest import build_manifest, copy_latest_to_run, p
 from codebase_lens.reports.snapshot import write_snapshot_bundle
 from codebase_lens.reports.scanner_outputs import write_file_inventory, write_tree_report
 from codebase_lens.scanners.universe import discover_file_universe
+from codebase_lens.reports.contract import write_contract_audit_reports
+from codebase_lens.reports.diff import write_diff_reports
 
 
 def _add_global_options(parser: argparse.ArgumentParser) -> None:
@@ -4121,7 +4123,8 @@ def _run_contract(args: argparse.Namespace) -> int:
         payload = contract_result_payload(result)
 
         layout = prepare_output_layout(repo_root, args.out, archive=not args.no_archive)
-        contract_path = write_json_report(layout.latest_dir / "contract_report.json", payload)
+        contract_outputs = write_contract_audit_reports(layout, payload)
+        contract_path = layout.latest_dir / "contract_audit.json"
 
         manifest = build_manifest(
             **_base_manifest_args(
@@ -4130,7 +4133,7 @@ def _run_contract(args: argparse.Namespace) -> int:
                 "contract",
                 {
                     "manifest_json": ".codecontext/latest/manifest.json",
-                    "contract_report_json": ".codecontext/latest/contract_report.json",
+                    **contract_outputs,
                 },
             )
         )
@@ -4309,12 +4312,17 @@ def _run_diff(args: argparse.Namespace) -> int:
             payload["changed_symbols"] = changed_symbol_result_payload(symbol_result)
 
         layout = prepare_output_layout(repo_root, args.out, archive=not args.no_archive)
-        diff_path = write_json_report(layout.latest_dir / "diff.json", payload)
-
         outputs = {
             "manifest_json": ".codecontext/latest/manifest.json",
-            "diff_json": ".codecontext/latest/diff.json",
+            **write_diff_reports(
+                layout,
+                diff_result,
+                payload,
+                changed_symbols_payload=payload.get("changed_symbols") if args.symbols else None,
+                base=args.base,
+            ),
         }
+        diff_path = layout.latest_dir / "diff.json"
 
         manifest = build_manifest(
             **_base_manifest_args(
@@ -4614,6 +4622,12 @@ def builtin_cbl_contract() -> dict[str, Any]:
             "docs/AI_HANDOFF_WORKFLOW.md",
             "docs/RELEASE_CHECKLIST.md",
             "scripts/dev/audits/audit_phase24_documentation_workflow.py",
+            "src/codebase_lens/core/budget.py",
+            "src/codebase_lens/reports/diff.py",
+            "src/codebase_lens/reports/contract.py",
+            "scripts/dev/audits/audit_phase25_report_contract_parity.py",
+            "docs/V0_1_RELEASE_STATUS.md",
+            "scripts/dev/audits/audit_phase26_v01_release_closure.py",
 ],
         "required_symbols": [
             {
@@ -4732,6 +4746,29 @@ def builtin_cbl_contract() -> dict[str, Any]:
                 "symbols": [
                     "HandoffProjectionResult",
                     "write_handoff_projection_reports",
+                ],
+            },
+            {
+                "path": "src/codebase_lens/core/budget.py",
+                "symbols": [
+                    "estimate_tokens_for_bytes",
+                    "estimate_tokens_for_text",
+                    "ranked_budget_file_records",
+                    "build_budget_report_payload",
+                ],
+            },
+            {
+                "path": "src/codebase_lens/reports/diff.py",
+                "symbols": [
+                    "render_diff_summary_markdown",
+                    "write_diff_reports",
+                ],
+            },
+            {
+                "path": "src/codebase_lens/reports/contract.py",
+                "symbols": [
+                    "render_contract_audit_markdown",
+                    "write_contract_audit_reports",
                 ],
             },
 ],
@@ -7144,7 +7181,88 @@ def write_audit_report_pair(repo_root: str | Path, name: str, payload: dict[str,
 ###############################################################################
 ### FILE: codebase_lens/core/budget.py
 ###############################################################################
-"""Reserved module boundary for CBL. Implementation arrives in later slices."""
+from __future__ import annotations
+
+from typing import Any
+
+ESTIMATION_METHOD = "heuristic: max(1, file_size_bytes // 4)"
+
+
+def estimate_tokens_for_bytes(size_bytes: int | None) -> int:
+    size = int(size_bytes or 0)
+    if size <= 0:
+        return 1
+    return max(1, size // 4)
+
+
+def estimate_tokens_for_text(text: str) -> int:
+    return max(1, len(text) // 4)
+
+
+def focus_hits_for_path(path: str, focus_terms: tuple[str, ...]) -> int:
+    if not focus_terms:
+        return 0
+    lowered = path.lower()
+    return sum(1 for term in focus_terms if term.lower() in lowered)
+
+
+def ranked_budget_file_records(
+    included_files: object,
+    *,
+    focus_terms: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    ranked_files: list[dict[str, Any]] = []
+
+    for record in list(included_files or ()):
+        path = str(getattr(record, "path", ""))
+        size_bytes = int(getattr(record, "size_bytes", 0) or 0)
+        estimated_tokens = estimate_tokens_for_bytes(size_bytes)
+        focus_hits = focus_hits_for_path(path, focus_terms)
+
+        ranked_files.append(
+            {
+                "path": path,
+                "size_bytes": size_bytes,
+                "estimated_tokens": estimated_tokens,
+                "focus_hits": focus_hits,
+                "priority_score": focus_hits * 1000 + max(0, 100000 - size_bytes),
+            }
+        )
+
+    ranked_files.sort(key=lambda item: (-int(item["priority_score"]), str(item["path"])))
+    return ranked_files
+
+
+def build_budget_report_payload(
+    included_files: object,
+    *,
+    budget: int,
+    focus_terms: tuple[str, ...],
+    changed_only: bool,
+    python_files: list[str],
+) -> dict[str, Any]:
+    ranked_files = ranked_budget_file_records(included_files, focus_terms=focus_terms)
+    total_estimated_tokens = sum(int(item["estimated_tokens"]) for item in ranked_files)
+
+    return {
+        "schema": {
+            "name": "cbl.budget_report",
+            "version": 2,
+        },
+        "scope": "changed" if changed_only else "full",
+        "requested_budget_tokens": budget,
+        "focus_terms": list(focus_terms),
+        "estimation_method": ESTIMATION_METHOD,
+        "total_estimated_file_tokens": total_estimated_tokens,
+        "budget_pressure": "over_budget" if total_estimated_tokens > budget else "within_budget",
+        "python_files_analyzed": python_files,
+        "ranked_files": ranked_files[:250],
+        "counts": {
+            "ranked_files": len(ranked_files),
+            "python_files_analyzed": len(python_files),
+            "focus_terms": len(focus_terms),
+        },
+    }
 
 
 
@@ -8878,14 +8996,327 @@ def write_clean_report(layout: OutputLayout, result: CleanResult) -> Path:
 ###############################################################################
 ### FILE: codebase_lens/reports/contract.py
 ###############################################################################
-"""Reserved module boundary for CBL. Implementation arrives in later slices."""
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+from codebase_lens.reports.json import write_json_report
+from codebase_lens.reports.manifest import OutputLayout
+
+
+def _counts(payload: dict[str, Any]) -> dict[str, Any]:
+    value = payload.get("counts", {})
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _violations(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    value = payload.get("violations", [])
+    return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+
+def _warnings(payload: dict[str, Any]) -> list[str]:
+    value = payload.get("warnings", [])
+    return [str(item) for item in value] if isinstance(value, list) else []
+
+
+def _contract_name(payload: dict[str, Any]) -> str:
+    return str(payload.get("name") or payload.get("contract_name") or payload.get("contract_id") or "architecture contract")
+
+
+def _violation_line(item: dict[str, Any]) -> str:
+    rule = item.get("rule_id", "unknown-rule")
+    severity = item.get("severity", "unknown")
+    path = item.get("path") or "<repo>"
+    line = item.get("line")
+    evidence = item.get("evidence")
+    message = item.get("message", "")
+
+    location = f"{path}:L{line}" if line else str(path)
+    rendered = f"- `{severity}` `{rule}` at `{location}` — {message}"
+    if evidence:
+        rendered += f" Evidence: `{evidence}`"
+    return rendered
+
+
+def render_contract_audit_markdown(payload: dict[str, Any]) -> str:
+    counts = _counts(payload)
+    violations = _violations(payload)
+    warnings = _warnings(payload)
+
+    errors = [item for item in violations if item.get("severity") == "error"]
+    non_errors = [item for item in violations if item.get("severity") != "error"]
+
+    lines: list[str] = [
+        "# Architecture Contract Audit",
+        "",
+        "## Contract Metadata",
+        "",
+        f"- Contract: `{_contract_name(payload)}`",
+        f"- Contract ID: `{payload.get('contract_id', payload.get('id', 'unknown'))}`",
+        f"- Schema: `{payload.get('schema', {}).get('name', 'cbl.contract_audit') if isinstance(payload.get('schema'), dict) else 'cbl.contract_audit'}`",
+        "",
+        "## Summary",
+        "",
+    ]
+
+    for key in sorted(counts):
+        lines.append(f"- {key}: {counts[key]}")
+
+    if not counts:
+        lines.append("- No count payload was emitted.")
+
+    lines.extend(["", "## Failed Rules", ""])
+    if errors:
+        lines.extend(_violation_line(item) for item in errors)
+    else:
+        lines.append("- No failed rules.")
+
+    lines.extend(["", "## Warnings", ""])
+    if warnings:
+        lines.extend(f"- {item}" for item in warnings)
+    else:
+        lines.append("- No warnings.")
+
+    lines.extend(["", "## Informational Findings", ""])
+    if non_errors:
+        lines.extend(_violation_line(item) for item in non_errors)
+    else:
+        lines.append("- No non-error findings.")
+
+    lines.extend(["", "## Passed Rules", ""])
+    if not errors:
+        lines.append("- Required files, required symbols, and forbidden-import checks produced no error-severity violations.")
+    else:
+        lines.append("- Some contract rules failed; inspect `contract_audit.json` for exact violation records.")
+
+    lines.extend(["", "## Skipped Rules", ""])
+    lines.append("- No explicit skipped-rule model is currently emitted by the contract engine.")
+
+    lines.extend(["", "## Evidence", ""])
+    if violations:
+        for item in violations[:120]:
+            path = item.get("path") or "<repo>"
+            line = item.get("line")
+            evidence = item.get("evidence") or path
+            location = f"{path}:L{line}" if line else str(path)
+            lines.append(f"- `{item.get('rule_id', 'unknown-rule')}` → `{location}`; evidence `{evidence}`")
+        if len(violations) > 120:
+            lines.append(f"- ... {len(violations) - 120} additional evidence records omitted from Markdown; see `contract_audit.json`.")
+    else:
+        lines.append("- `<repo>:architecture-contract`")
+
+    lines.extend(["", "## Suggested Remediation", ""])
+    if errors:
+        lines.append("- Repair the failed rules above, then rerun `python -m codebase_lens contract --no-archive`.")
+    else:
+        lines.append("- No remediation required.")
+    lines.append("- For full release validation, run `python .\\scripts\\dev\\audits\\audit_phase25_report_contract_parity.py`.")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def write_contract_audit_reports(
+    layout: OutputLayout,
+    payload: dict[str, Any],
+) -> dict[str, str]:
+    canonical_payload = dict(payload)
+    canonical_payload.setdefault("schema", {"name": "cbl.contract_audit", "version": 1})
+
+    write_json_report(layout.latest_dir / "contract_audit.json", canonical_payload)
+    write_json_report(layout.latest_dir / "contract_report.json", canonical_payload)
+
+    markdown = render_contract_audit_markdown(canonical_payload)
+    (layout.latest_dir / "contract_audit.md").write_text(markdown, encoding="utf-8", newline="\n")
+
+    return {
+        "contract_audit_json": ".codecontext/latest/contract_audit.json",
+        "contract_audit_md": ".codecontext/latest/contract_audit.md",
+        "contract_report_json": ".codecontext/latest/contract_report.json",
+    }
 
 
 
 ###############################################################################
 ### FILE: codebase_lens/reports/diff.py
 ###############################################################################
-"""Reserved module boundary for CBL. Implementation arrives in later slices."""
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+from codebase_lens.reports.json import write_json_report
+from codebase_lens.reports.manifest import OutputLayout
+
+
+def _changed_files(diff_result: object) -> tuple[object, ...]:
+    value = getattr(diff_result, "changed_files", ())
+    return tuple(value or ())
+
+
+def _counts(diff_result: object) -> dict[str, Any]:
+    value = getattr(diff_result, "counts", {})
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _warnings(diff_result: object) -> tuple[str, ...]:
+    value = getattr(diff_result, "warnings", ())
+    return tuple(str(item) for item in (value or ()))
+
+
+def _status_label(status: str) -> str:
+    return {
+        "A": "added",
+        "M": "modified",
+        "D": "deleted",
+        "R": "renamed",
+        "C": "copied",
+        "U": "unmerged",
+        "?": "untracked",
+    }.get(status, status or "unknown")
+
+
+def _file_line(record: object) -> str:
+    path = str(getattr(record, "path", ""))
+    status = str(getattr(record, "status", ""))
+    origin = str(getattr(record, "origin", ""))
+    additions = getattr(record, "additions", None)
+    deletions = getattr(record, "deletions", None)
+    binary = bool(getattr(record, "is_binary", False))
+    hunks = getattr(record, "hunks", ()) or ()
+
+    stats = []
+    if additions is not None:
+        stats.append(f"+{additions}")
+    if deletions is not None:
+        stats.append(f"-{deletions}")
+    if binary:
+        stats.append("binary")
+    stats.append(f"hunks={len(hunks)}")
+
+    return f"- `{path}` — {_status_label(status)}; origin `{origin}`; {', '.join(stats)}"
+
+
+def _changed_symbol_lines(changed_symbols_payload: dict[str, Any] | None) -> list[str]:
+    if not changed_symbols_payload:
+        return ["- Changed-symbol mapping was not requested. Re-run `cbl diff --symbols` for line-overlap symbol evidence."]
+
+    records = changed_symbols_payload.get("changed_symbols", [])
+    if not isinstance(records, list) or not records:
+        return ["- No changed Python symbols were identified."]
+
+    lines = []
+    for record in records[:80]:
+        if not isinstance(record, dict):
+            continue
+        path = record.get("path", "")
+        name = record.get("qualified_name") or record.get("name") or "<unknown>"
+        start = record.get("start_line", "?")
+        end = record.get("end_line", start)
+        origin = record.get("change_origin", "unknown")
+        lines.append(f"- `{name}` — `{path}:L{start}-L{end}`; origin `{origin}`")
+
+    if len(records) > 80:
+        lines.append(f"- ... {len(records) - 80} additional changed symbols omitted from Markdown; see `diff.json`.")
+
+    return lines or ["- No changed Python symbols were identified."]
+
+
+def render_diff_summary_markdown(
+    diff_result: object,
+    *,
+    changed_symbols_payload: dict[str, Any] | None = None,
+    base: str | None = None,
+) -> str:
+    files = _changed_files(diff_result)
+    counts = _counts(diff_result)
+    warnings = _warnings(diff_result)
+
+    staged = [item for item in files if "staged" in str(getattr(item, "origin", ""))]
+    unstaged = [item for item in files if "unstaged" in str(getattr(item, "origin", ""))]
+    untracked = [item for item in files if "untracked" in str(getattr(item, "origin", ""))]
+
+    lines: list[str] = [
+        "# Diff Summary",
+        "",
+        "## Git Base",
+        "",
+        f"- Base argument: `{base or '(not supplied)'}`",
+        f"- Changed files: {counts.get('changed_files_count', len(files))}",
+        f"- Hunks: {counts.get('hunk_count', 0)}",
+        "",
+        "## Staged Changes",
+        "",
+    ]
+
+    lines.extend(_file_line(item) for item in staged[:80])
+    if not staged:
+        lines.append("- No staged changes detected.")
+
+    lines.extend(["", "## Unstaged Changes", ""])
+    lines.extend(_file_line(item) for item in unstaged[:80])
+    if not unstaged:
+        lines.append("- No unstaged changes detected.")
+
+    lines.extend(["", "## Untracked Source Files", ""])
+    lines.extend(_file_line(item) for item in untracked[:80])
+    if not untracked:
+        lines.append("- No untracked source files detected.")
+
+    lines.extend(["", "## Changed Files", ""])
+    lines.extend(_file_line(item) for item in files[:120])
+    if not files:
+        lines.append("- No changed files detected.")
+    if len(files) > 120:
+        lines.append(f"- ... {len(files) - 120} additional changed files omitted from Markdown; see `diff.json`.")
+
+    lines.extend(["", "## Changed Symbols", ""])
+    lines.extend(_changed_symbol_lines(changed_symbols_payload))
+
+    lines.extend(["", "## Diff Stats", ""])
+    for key in sorted(counts):
+        lines.append(f"- {key}: {counts[key]}")
+
+    if warnings:
+        lines.extend(["", "## Warnings", ""])
+        lines.extend(f"- {item}" for item in warnings)
+
+    lines.extend(
+        [
+            "",
+            "## Follow-Up Commands",
+            "",
+            "- `python -m codebase_lens changed --no-archive`",
+            "- `python -m codebase_lens diff --symbols --no-archive`",
+            "- `python -m codebase_lens pack --changed --issue \"review current changes\" --no-archive`",
+            "",
+        ]
+    )
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def write_diff_reports(
+    layout: OutputLayout,
+    diff_result: object,
+    payload: dict[str, Any],
+    *,
+    changed_symbols_payload: dict[str, Any] | None = None,
+    base: str | None = None,
+) -> dict[str, str]:
+    write_json_report(layout.latest_dir / "diff.json", payload)
+
+    summary = render_diff_summary_markdown(
+        diff_result,
+        changed_symbols_payload=changed_symbols_payload,
+        base=base,
+    )
+    (layout.latest_dir / "diff_summary.md").write_text(summary, encoding="utf-8", newline="\n")
+
+    return {
+        "diff_json": ".codecontext/latest/diff.json",
+        "diff_summary_md": ".codecontext/latest/diff_summary.md",
+    }
 
 
 
@@ -11630,6 +12061,7 @@ def write_tree_report(
 ###############################################################################
 from __future__ import annotations
 
+import json
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any
@@ -11657,6 +12089,8 @@ from codebase_lens.reports.graph import write_evidence_graph_reports
 from codebase_lens.reports.symbol_graph import write_symbol_graph_reports
 from codebase_lens.reports.scanner_outputs import write_file_inventory, write_tree_report
 from codebase_lens.scanners.universe import discover_file_universe
+from codebase_lens.core.budget import build_budget_report_payload
+from codebase_lens.git.discover import collect_git_info
 
 
 @dataclass(frozen=True)
@@ -11760,48 +12194,274 @@ def _write_budget_report(
     changed_only: bool,
     python_files: list[str],
 ) -> Path:
-    included_files = list(getattr(universe, "included_files", ()))
+    payload = build_budget_report_payload(
+        getattr(universe, "included_files", ()),
+        budget=budget,
+        focus_terms=focus_terms,
+        changed_only=changed_only,
+        python_files=python_files,
+    )
+    return write_json_report(layout.latest_dir / "budget_report.json", payload)
+def _git_state_payload(repo_root: Path) -> dict[str, Any]:
+    git_info = collect_git_info(repo_root)
+    diff_result = collect_changed_files(repo_root, include_untracked=True)
 
-    ranked_files = []
-    for record in included_files:
-        path = getattr(record, "path", "")
-        size_bytes = int(getattr(record, "size_bytes", 0) or 0)
-        estimated_tokens = max(1, size_bytes // 4) if size_bytes else 1
-        focus_hits = _focus_hits_for_path(path, focus_terms)
-        ranked_files.append(
-            {
-                "path": path,
-                "size_bytes": size_bytes,
-                "estimated_tokens": estimated_tokens,
-                "focus_hits": focus_hits,
-                "priority_score": focus_hits * 1000 + max(0, 100000 - size_bytes),
-            }
-        )
-
-    ranked_files.sort(key=lambda item: (-int(item["priority_score"]), str(item["path"])))
-
-    total_estimated_tokens = sum(int(item["estimated_tokens"]) for item in ranked_files)
-    payload = {
+    return {
         "schema": {
-            "name": "cbl.budget_report",
+            "name": "cbl.git_state",
             "version": 1,
         },
-        "scope": "changed" if changed_only else "full",
-        "requested_budget_tokens": budget,
-        "focus_terms": list(focus_terms),
-        "estimation_method": "heuristic: max(1, file_size_bytes // 4)",
-        "total_estimated_file_tokens": total_estimated_tokens,
-        "budget_pressure": "over_budget" if total_estimated_tokens > budget else "within_budget",
-        "python_files_analyzed": python_files,
-        "ranked_files": ranked_files[:250],
-        "counts": {
-            "ranked_files": len(ranked_files),
-            "python_files_analyzed": len(python_files),
-            "focus_terms": len(focus_terms),
+        "git": {
+            "available": git_info.available,
+            "is_repo": git_info.is_repo,
+            "branch": git_info.branch,
+            "head": git_info.head,
+            "is_dirty": git_info.is_dirty,
+            "staged_count": git_info.staged_count,
+            "unstaged_count": git_info.unstaged_count,
+            "untracked_count": git_info.untracked_count,
+            "warnings": list(git_info.warnings),
         },
+        "changed_files": [_jsonable(record) for record in diff_result.changed_files],
+        "counts": dict(diff_result.counts),
+        "warnings": list(diff_result.warnings),
     }
-    return write_json_report(layout.latest_dir / "budget_report.json", payload)
 
+
+def _write_git_state_report(layout: OutputLayout, repo_root: Path) -> Path:
+    return write_json_report(layout.latest_dir / "git_state.json", _git_state_payload(repo_root))
+
+
+def _read_json_if_present(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _read_text_excerpt(path: Path, *, max_lines: int = 80) -> str:
+    if not path.is_file():
+        return "(not emitted)"
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    if len(lines) > max_lines:
+        return "\n".join(lines[:max_lines] + [f"... {len(lines) - max_lines} additional lines omitted from snapshot markdown."])
+    return "\n".join(lines) if lines else "(empty)"
+
+
+def _extension_summary(universe) -> list[str]:
+    counts: dict[str, int] = {}
+    for record in getattr(universe, "included_files", ()):
+        suffix = Path(str(getattr(record, "path", ""))).suffix.lower() or "<none>"
+        counts[suffix] = counts.get(suffix, 0) + 1
+    return [f"- `{suffix}`: {count}" for suffix, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:40]]
+
+
+def _project_markers(root: Path) -> list[str]:
+    markers = [
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "package.json",
+        "Cargo.toml",
+        "go.mod",
+        "pom.xml",
+        "build.gradle",
+    ]
+    return [marker for marker in markers if (root / marker).exists()]
+
+
+def _write_repo_snapshot_markdown(
+    layout: OutputLayout,
+    repo_root: Path,
+    *,
+    universe,
+    outputs: dict[str, str],
+    counts: dict[str, int],
+    warnings: list[str],
+    changed_only: bool,
+    budget: int,
+    focus_terms: tuple[str, ...],
+) -> Path:
+    git_state = _read_json_if_present(layout.latest_dir / "git_state.json")
+    budget_report = _read_json_if_present(layout.latest_dir / "budget_report.json")
+    omissions = _read_json_if_present(layout.latest_dir / "omissions.json")
+    symbols = _read_json_if_present(layout.latest_dir / "symbol_index.json")
+    imports = _read_json_if_present(layout.latest_dir / "import_graph.json")
+    cli_inventory = _read_json_if_present(layout.latest_dir / "cli_inventory.json")
+    tests = _read_json_if_present(layout.latest_dir / "test_inventory.json")
+
+    git_payload = git_state.get("git", {}) if isinstance(git_state.get("git"), dict) else {}
+    omission_counts = omissions.get("counts", {}) if isinstance(omissions.get("counts"), dict) else {}
+    budget_counts = budget_report.get("counts", {}) if isinstance(budget_report.get("counts"), dict) else {}
+
+    lines: list[str] = [
+        "# Repository Snapshot",
+        "",
+        "## Generation Metadata",
+        "",
+        f"- Scope: `{'changed' if changed_only else 'full'}`",
+        f"- Requested budget tokens: {budget}",
+        f"- Focus terms: {list(focus_terms)}",
+        f"- Output directory: `.codecontext/latest/`",
+        "",
+        "## Repository Identity",
+        "",
+        f"- Repository name: `{repo_root.name}`",
+        "- Repository root is redacted from AI-facing Markdown by default.",
+        "",
+        "## Git State",
+        "",
+        f"- Git available: {git_payload.get('available')}",
+        f"- Git repository: {git_payload.get('is_repo')}",
+        f"- Branch: `{git_payload.get('branch') or '(none)'}`",
+        f"- Head: `{git_payload.get('head') or '(none)'}`",
+        f"- Dirty: {git_payload.get('is_dirty')}",
+        f"- Staged: {git_payload.get('staged_count', 0)}",
+        f"- Unstaged: {git_payload.get('unstaged_count', 0)}",
+        f"- Untracked: {git_payload.get('untracked_count', 0)}",
+        "",
+        "## Project Markers",
+        "",
+    ]
+
+    markers = _project_markers(repo_root)
+    lines.extend(f"- `{marker}`" for marker in markers)
+    if not markers:
+        lines.append("- No standard project markers detected.")
+
+    lines.extend(
+        [
+            "",
+            "## File Universe Summary",
+            "",
+        ]
+    )
+    universe_counts = getattr(universe, "counts", {})
+    if isinstance(universe_counts, dict):
+        for key in sorted(universe_counts):
+            lines.append(f"- {key}: {universe_counts[key]}")
+    else:
+        lines.append("- File-universe counts unavailable.")
+
+    lines.extend(
+        [
+            "",
+            "## Top-Level Tree",
+            "",
+            _read_text_excerpt(layout.latest_dir / "repo_tree.txt", max_lines=80),
+            "",
+            "## Language/Extension Summary",
+            "",
+        ]
+    )
+    extension_lines = _extension_summary(universe)
+    lines.extend(extension_lines or ["- No extension summary available."])
+
+    lines.extend(
+        [
+            "",
+            "## Python Package Summary",
+            "",
+            f"- Python files analyzed: {counts.get('python_files_analyzed', 0)}",
+            f"- Symbols: {counts.get('symbols', 0)}",
+            f"- Imports: {counts.get('imports', 0)}",
+            f"- Routes: {counts.get('routes', 0)}",
+            f"- CLI commands: {counts.get('commands', 0)}",
+            f"- Test files: {counts.get('test_files', 0)}",
+            f"- Test functions: {counts.get('test_functions', 0)}",
+            "",
+            "## Important Symbols",
+            "",
+        ]
+    )
+
+    symbol_records = symbols.get("symbols", [])
+    if isinstance(symbol_records, list) and symbol_records:
+        for record in symbol_records[:30]:
+            if isinstance(record, dict):
+                name = record.get("qualified_name") or record.get("name") or "<unknown>"
+                path = record.get("path", "")
+                start = record.get("start_line", "?")
+                end = record.get("end_line", start)
+                kind = record.get("kind", "symbol")
+                lines.append(f"- `{name}` ({kind}) — `{path}:L{start}-L{end}`")
+    else:
+        lines.append("- No symbols emitted.")
+
+    lines.extend(["", "## CLI Inventory Summary", ""])
+    cli_counts = cli_inventory.get("counts", {}) if isinstance(cli_inventory.get("counts"), dict) else {}
+    if cli_counts:
+        for key in sorted(cli_counts):
+            lines.append(f"- {key}: {cli_counts[key]}")
+    else:
+        lines.append("- No CLI inventory counts emitted.")
+
+    lines.extend(["", "## Test Inventory Summary", ""])
+    test_counts = tests.get("counts", {}) if isinstance(tests.get("counts"), dict) else {}
+    if test_counts:
+        for key in sorted(test_counts):
+            lines.append(f"- {key}: {test_counts[key]}")
+    else:
+        lines.append("- No test inventory counts emitted.")
+
+    lines.extend(["", "## Import Graph Summary", ""])
+    import_counts = imports.get("counts", {}) if isinstance(imports.get("counts"), dict) else {}
+    if import_counts:
+        for key in sorted(import_counts):
+            lines.append(f"- {key}: {import_counts[key]}")
+    else:
+        lines.append("- No import graph counts emitted.")
+
+    lines.extend(
+        [
+            "",
+            "## Safety and Redaction Summary",
+            "",
+            f"- Redaction enabled: {getattr(getattr(universe, 'redaction', None), 'enabled', True)}",
+            f"- Redacted occurrences: {getattr(getattr(universe, 'redaction', None), 'redacted_occurrences_count', 0)}",
+            f"- Budget estimation method: `{budget_report.get('estimation_method', 'unknown')}`",
+            f"- Budget pressure: `{budget_report.get('budget_pressure', 'unknown')}`",
+            f"- Ranked files: {budget_counts.get('ranked_files', 0)}",
+            "",
+            "## Skipped/Omitted Files Summary",
+            "",
+        ]
+    )
+
+    if omission_counts:
+        for key in sorted(omission_counts):
+            lines.append(f"- {key}: {omission_counts[key]}")
+    else:
+        lines.append("- No omission counts emitted.")
+
+    if warnings:
+        lines.extend(["", "### Warnings", ""])
+        lines.extend(f"- {warning}" for warning in warnings[:80])
+
+    lines.extend(
+        [
+            "",
+            "## Suggested Follow-Up Commands",
+            "",
+            "- `python -m codebase_lens pack --issue \"describe task\" --budget 24000 --no-archive`",
+            "- `python -m codebase_lens diff --symbols --no-archive`",
+            "- `python -m codebase_lens graph --changed --depth 1 --limit 80 --no-archive`",
+            "- `python -m codebase_lens contract --no-archive`",
+            "",
+            "## Generated Outputs",
+            "",
+        ]
+    )
+
+    for key in sorted(outputs):
+        lines.append(f"- `{key}` → `{outputs[key]}`")
+
+    destination = layout.latest_dir / "repo_snapshot.md"
+    destination.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8", newline="\n")
+    return destination
 
 def _write_snapshot_index(
     layout: OutputLayout,
@@ -11850,6 +12510,9 @@ def write_snapshot_bundle(
 
     outputs["file_inventory_json"] = ".codecontext/latest/file_inventory.json"
     outputs["repo_tree_txt"] = ".codecontext/latest/repo_tree.txt"
+
+    _write_git_state_report(layout, root)
+    outputs["git_state_json"] = ".codecontext/latest/git_state.json"
 
     omissions_path = _write_omissions_report(layout, universe, changed_only=changed_only)
     outputs["omissions_json"] = ".codecontext/latest/omissions.json"
@@ -12008,6 +12671,19 @@ def write_snapshot_bundle(
         "evidence_graph_edges": evidence_graph.counts.get("edges", 0),
         "evidence_graph_unresolved_edges": evidence_graph.counts.get("unresolved_edges", 0),
     }
+
+    _write_repo_snapshot_markdown(
+        layout,
+        root,
+        universe=universe,
+        outputs=outputs,
+        counts=counts,
+        warnings=warnings,
+        changed_only=changed_only,
+        budget=budget,
+        focus_terms=focus_terms,
+    )
+    outputs["repo_snapshot_md"] = ".codecontext/latest/repo_snapshot.md"
 
     _write_snapshot_index(
         layout,

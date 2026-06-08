@@ -6,6 +6,7 @@ from pathlib import Path
 from codebase_lens.core.graph import EvidenceGraph, evidence_graph_payload, graph_slice_payload
 from codebase_lens.reports.json import write_json_report
 from codebase_lens.reports.manifest import OutputLayout
+from codebase_lens.core.redaction import redact_console_text
 
 
 CALL_EDGE_KINDS = {
@@ -138,9 +139,9 @@ def render_graph_summary(graph: EvidenceGraph) -> str:
             "## Follow-Up Commands",
             "",
             "- `cbl graph --symbol <symbol> --depth 2` once graph querying is enabled.",
-            "- `cbl symbol --name <symbol> --context 80` for high-resolution source evidence.",
-            "- `cbl file --path <path> --lines <start>:<end>` for exact file excerpts.",
-            "- `cbl callers --name <symbol>` for legacy caller discovery.",
+            "- `cbl symbol <symbol> --context 80` for high-resolution source evidence.",
+            "- `cbl file <path> --lines <start>:<end>` for exact file excerpts.",
+            "- `cbl callers <symbol>` for legacy caller discovery.",
         ]
     )
 
@@ -153,7 +154,7 @@ def write_evidence_graph_reports(layout: OutputLayout, graph: EvidenceGraph) -> 
     write_json_report(layout.latest_dir / "module_graph.json", graph_slice_payload(graph, edge_kinds=MODULE_EDGE_KINDS))
 
     (layout.latest_dir / "graph_summary.md").write_text(
-        render_graph_summary(graph),
+        redact_console_text(render_graph_summary(graph)),
         encoding="utf-8",
         newline="\n",
     )

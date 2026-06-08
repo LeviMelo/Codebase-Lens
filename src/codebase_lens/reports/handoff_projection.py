@@ -8,6 +8,7 @@ from typing import Any
 
 from codebase_lens.reports.json import write_json_report
 from codebase_lens.reports.manifest import OutputLayout
+from codebase_lens.core.redaction import redact_console_text
 
 
 @dataclass(frozen=True)
@@ -1625,9 +1626,9 @@ def _render_projection_markdown(payload: dict[str, Any]) -> str:
             "",
             "- `cbl graph --symbol <symbol> --depth 2 --budget 24000`",
             "- `cbl graph --path <path> --depth 1 --budget 24000`",
-            "- `cbl symbol --name <symbol> --context 80`",
-            "- `cbl file --path <path> --lines <start>:<end>`",
-            "- `cbl callers --name <symbol>`",
+            "- `cbl symbol <symbol> --context 80`",
+            "- `cbl file <path> --lines <start>:<end>`",
+            "- `cbl callers <symbol>`",
             "- `cbl imports --module <module>`",
             "- `cbl pack --issue \"<issue>\" --budget 24000`",
             "",
@@ -1672,7 +1673,7 @@ def write_handoff_projection_reports(
 
     write_json_report(layout.latest_dir / "handoff_projection.json", payload)
     (layout.latest_dir / "handoff_projection.md").write_text(
-        _render_projection_markdown(payload),
+        redact_console_text(_render_projection_markdown(payload)),
         encoding="utf-8",
         newline="\n",
     )

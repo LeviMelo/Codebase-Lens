@@ -9,6 +9,7 @@ from codebase_lens.analyzers.symbol_graph import (
 )
 from codebase_lens.reports.json import write_json_report
 from codebase_lens.reports.manifest import OutputLayout
+from codebase_lens.core.redaction import redact_console_text
 
 
 def write_symbol_graph_reports(layout: OutputLayout, result: SymbolGraphResult) -> dict[str, str]:
@@ -17,7 +18,7 @@ def write_symbol_graph_reports(layout: OutputLayout, result: SymbolGraphResult) 
 
     write_json_report(json_path, symbol_graph_payload(result))
     markdown_path.write_text(
-        render_symbol_graph_markdown(result),
+        redact_console_text(render_symbol_graph_markdown(result)),
         encoding="utf-8",
         newline="\n",
     )

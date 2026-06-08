@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from collections import Counter, deque
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
+
+UnresolvedMode = Literal["seed", "selected", "none"]
 
 
 @dataclass(frozen=True)
@@ -10,7 +12,7 @@ class GraphQueryResult:
     query: dict[str, Any]
     nodes: tuple[dict[str, Any], ...]
     edges: tuple[dict[str, Any], ...]
-    counts: dict[str, int]
+    counts: dict[str, int | dict[str, int]]
     warnings: tuple[str, ...]
 
 
@@ -148,8 +150,28 @@ def _expand(seed_ids: set[str], edges: list[dict[str, Any]], *, depth: int) -> s
     return visited
 
 
-def _selected_edges(edges: list[dict[str, Any]], selected_ids: set[str], *, include_unresolved_for_selected: bool = True) -> tuple[dict[str, Any], ...]:
+def _unresolved_sources_for_mode(mode: str, *, seed_ids: set[str], selected_ids: set[str]) -> set[str]:
+    if mode == "none":
+        return set()
+    if mode == "selected":
+        return set(selected_ids)
+    return set(seed_ids)
+
+
+def _selected_edges(
+    edges: list[dict[str, Any]],
+    selected_ids: set[str],
+    *,
+    seed_ids: set[str],
+    unresolved_mode: str = "seed",
+    unresolved_per_source_limit: int = 25,
+    total_edge_limit: int = 250,
+) -> tuple[tuple[dict[str, Any], ...], dict[str, int]]:
     values: list[dict[str, Any]] = []
+    omitted_unresolved = 0
+    omitted_by_total_limit = 0
+    unresolved_seen_by_source: dict[str, int] = defaultdict(int)
+    unresolved_sources = _unresolved_sources_for_mode(unresolved_mode, seed_ids=seed_ids, selected_ids=selected_ids)
 
     for edge in edges:
         source = str(edge.get("source") or "")
@@ -159,14 +181,27 @@ def _selected_edges(edges: list[dict[str, Any]], selected_ids: set[str], *, incl
             values.append(edge)
             continue
 
-        if include_unresolved_for_selected and source in selected_ids and not target:
+        if source in unresolved_sources and not target:
+            unresolved_seen_by_source[source] += 1
+            if unresolved_seen_by_source[source] > unresolved_per_source_limit:
+                omitted_unresolved += 1
+                continue
             values.append(edge)
 
     by_id: dict[str, dict[str, Any]] = {}
     for edge in values:
         by_id[str(edge.get("id"))] = edge
 
-    return tuple(sorted(by_id.values(), key=lambda item: (str(item.get("kind")), str(item.get("source")), str(item.get("target") or ""), str(item.get("target_text") or ""))))
+    sorted_values = tuple(sorted(by_id.values(), key=lambda item: (str(item.get("kind")), str(item.get("source")), str(item.get("target") or ""), str(item.get("target_text") or ""))))
+
+    if total_edge_limit > 0 and len(sorted_values) > total_edge_limit:
+        omitted_by_total_limit = len(sorted_values) - total_edge_limit
+        sorted_values = sorted_values[:total_edge_limit]
+
+    return sorted_values, {
+        "omitted_unresolved_edges": omitted_unresolved,
+        "omitted_edges_by_limit": omitted_by_total_limit,
+    }
 
 
 def query_evidence_graph_payload(
@@ -178,30 +213,29 @@ def query_evidence_graph_payload(
     changed: bool = False,
     depth: int = 1,
     limit: int = 60,
+    unresolved_mode: UnresolvedMode = "seed",
 ) -> GraphQueryResult:
     nodes = [node for node in graph_payload.get("nodes", []) if isinstance(node, dict)]
     edges = [edge for edge in graph_payload.get("edges", []) if isinstance(edge, dict)]
+
+    if unresolved_mode not in {"seed", "selected", "none"}:
+        unresolved_mode = "seed"
 
     seed_ids: set[str] = set()
     warnings: list[str] = []
 
     if symbol:
         seed_ids.update(_node_id(node) for node in nodes if _matches_symbol(node, symbol))
-
     if path:
         seed_ids.update(_node_id(node) for node in nodes if _matches_path(node, path))
-
     if module:
         seed_ids.update(_node_id(node) for node in nodes if _matches_module(node, module))
-
     if changed:
         seed_ids.update(_changed_seed_nodes(nodes, edges))
 
     explicit_query = bool(symbol or path or module or changed)
-
     if explicit_query and not seed_ids:
         warnings.append("No graph nodes matched the requested query.")
-
     if not explicit_query:
         seed_ids.update(_default_seed_nodes(nodes, edges, limit=limit))
         if not seed_ids:
@@ -209,19 +243,26 @@ def query_evidence_graph_payload(
 
     selected_ids = _expand(seed_ids, edges, depth=max(0, depth))
     selected_nodes = [node for node in nodes if _node_id(node) in selected_ids]
-    selected_edges = _selected_edges(edges, selected_ids)
 
-    selected_nodes = sorted(
-        selected_nodes,
-        key=lambda node: (
+    def _query_node_priority(node: dict[str, Any]) -> tuple[int, int, str, str, str]:
+        node_id = _node_id(node)
+        return (
+            0 if node_id in seed_ids else 1,
             0 if _node_path(node).startswith("src/codebase_lens/") else 1,
             str(node.get("kind")),
             _node_path(node),
             _node_label(node),
-        ),
-    )[: max(limit, len(seed_ids))]
+        )
 
+    selected_nodes = sorted(selected_nodes, key=_query_node_priority)[: max(limit, len(seed_ids))]
     retained_ids = {_node_id(node) for node in selected_nodes}
+
+    selected_edges, omitted_counts = _selected_edges(
+        edges,
+        selected_ids,
+        seed_ids=seed_ids,
+        unresolved_mode=unresolved_mode,
+    )
     selected_edges = tuple(
         edge
         for edge in selected_edges
@@ -232,6 +273,11 @@ def query_evidence_graph_payload(
     edge_kinds = Counter(str(edge.get("kind")) for edge in selected_edges)
     node_kinds = Counter(str(node.get("kind")) for node in selected_nodes)
 
+    if omitted_counts["omitted_unresolved_edges"]:
+        warnings.append(f"Omitted {omitted_counts['omitted_unresolved_edges']} unresolved call-name edges by per-source cap.")
+    if omitted_counts["omitted_edges_by_limit"]:
+        warnings.append(f"Omitted {omitted_counts['omitted_edges_by_limit']} graph edges by total edge cap.")
+
     return GraphQueryResult(
         query={
             "symbol": symbol,
@@ -241,6 +287,7 @@ def query_evidence_graph_payload(
             "depth": depth,
             "limit": limit,
             "seed_count": len(seed_ids),
+            "unresolved_mode": unresolved_mode,
         },
         nodes=tuple(selected_nodes),
         edges=selected_edges,
@@ -249,6 +296,8 @@ def query_evidence_graph_payload(
             "edges": len(selected_edges),
             "seed_nodes": len(seed_ids),
             "unresolved_edges": sum(1 for edge in selected_edges if not edge.get("target")),
+            "omitted_unresolved_edges": omitted_counts["omitted_unresolved_edges"],
+            "omitted_edges_by_limit": omitted_counts["omitted_edges_by_limit"],
             "node_kinds": dict(sorted(node_kinds.items())),
             "edge_kinds": dict(sorted(edge_kinds.items())),
         },
@@ -260,7 +309,7 @@ def graph_query_payload(result: GraphQueryResult) -> dict[str, Any]:
     return {
         "schema": {
             "name": "cbl.graph_query",
-            "version": 1,
+            "version": 2,
         },
         "query": dict(result.query),
         "nodes": list(result.nodes),

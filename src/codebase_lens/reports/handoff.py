@@ -9,6 +9,7 @@ from codebase_lens.contracts.architecture import evaluate_contract, load_contrac
 from codebase_lens.reports.json import contract_result_payload, write_json_report
 from codebase_lens.reports.manifest import OutputLayout
 from codebase_lens.reports.snapshot import SnapshotBundleResult, write_snapshot_bundle
+from codebase_lens.core.redaction import redact_console_text
 
 
 @dataclass(frozen=True)
@@ -88,7 +89,7 @@ def _format_changed_symbols(layout: OutputLayout, *, max_items: int = 80) -> lis
 
 def _format_omissions(layout: OutputLayout, *, max_items: int = 60) -> list[str]:
     payload = _read_json(layout.latest_dir / "omissions.json")
-    records = payload.get("omissions", [])
+    records = payload.get("omitted_files") or payload.get("omissions", [])
     if not isinstance(records, list) or not records:
         return ["- No omitted files were reported by the scanner."]
 
@@ -152,7 +153,7 @@ def _changed_scope_notice(layout: OutputLayout, *, changed_only: bool) -> list[s
         "- `cbl pack --budget 16000`",
         "- `cbl snapshot --budget 16000`",
         "- `cbl symbols`",
-        "- `cbl callers --name <symbol>`",
+        "- `cbl callers <symbol>`",
     ]
 
 
@@ -297,7 +298,7 @@ def write_handoff_pack(
         markdown_lines.extend(f"- {warning}" for warning in warnings)
 
     handoff_path = layout.latest_dir / "ai_handoff.md"
-    handoff_path.write_text("\n".join(markdown_lines).rstrip() + "\n", encoding="utf-8", newline="\n")
+    handoff_path.write_text(redact_console_text("\n".join(markdown_lines).rstrip() + "\n"), encoding="utf-8", newline="\n")
     outputs["ai_handoff_md"] = ".codecontext/latest/ai_handoff.md"
 
     from codebase_lens.reports.handoff_projection import write_handoff_projection_reports
