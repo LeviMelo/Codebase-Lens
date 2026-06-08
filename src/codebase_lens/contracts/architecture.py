@@ -102,6 +102,8 @@ def builtin_cbl_contract() -> dict[str, Any]:
             "src/codebase_lens/reports/diff.py",
             "src/codebase_lens/reports/contract.py",
             "scripts/dev/audits/audit_phase25_report_contract_parity.py",
+            "docs/V0_1_RELEASE_STATUS.md",
+            "scripts/dev/audits/audit_phase26_v01_release_closure.py",
 ],
         "required_symbols": [
             {
