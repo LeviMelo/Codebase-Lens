@@ -92,6 +92,7 @@ def builtin_cbl_contract() -> dict[str, Any]:
             "src/codebase_lens/core/audit_artifacts.py",
             "src/codebase_lens/contracts/release_safety.py",
             "scripts/dev/audits/audit_phase22_release_safety.py",
+            "scripts/dev/audits/audit_phase23_audit_report_sanitization.py",
 ],
         "required_symbols": [
             {
