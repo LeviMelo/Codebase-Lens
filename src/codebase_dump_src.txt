@@ -20,8 +20,11 @@ Project structure for '/c/Users/Galaxy/LEVI/projects/CBL/src':
   codebase_lens/contracts/architecture.py
   codebase_lens/contracts/builtin_templates.py
   codebase_lens/contracts/command_surface.py
+  codebase_lens/contracts/fixture_matrix.py
+  codebase_lens/contracts/release_safety.py
   codebase_lens/contracts/schema.py
   codebase_lens/core/__init__.py
+  codebase_lens/core/audit_artifacts.py
   codebase_lens/core/budget.py
   codebase_lens/core/config.py
   codebase_lens/core/constants.py
@@ -59,498 +62,6 @@ Project structure for '/c/Users/Galaxy/LEVI/projects/CBL/src':
   codebase_lens/scanners/text.py
   codebase_lens/scanners/tree.py
   codebase_lens/scanners/universe.py
-
-
-
-###############################################################################
-### FILE: codebase_lens/contracts/command_surface.py
-###############################################################################
-from __future__ import annotations
-
-import argparse
-import json
-import os
-import shutil
-import subprocess
-import sys
-import tempfile
-from dataclasses import asdict, dataclass, field
-from pathlib import Path
-from typing import Any
-
-
-@dataclass(frozen=True)
-class CommandSurfaceIssue:
-    severity: str
-    code: str
-    message: str
-    details: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class CommandSurfaceAuditResult:
-    ok: bool
-    public_commands: tuple[str, ...]
-    parser_subcommands: tuple[str, ...]
-    issues: tuple[CommandSurfaceIssue, ...]
-    external_repo: dict[str, Any]
-
-
-# These are mandatory artifacts for `cbl pack`.
-# Do not include command-specific artifacts such as `tree.md`, which belongs to
-# the tree-report command surface rather than the handoff pack contract.
-CORE_EXTERNAL_PACK_ARTIFACTS = (
-    "manifest.json",
-    "handoff_projection.json",
-    "handoff_projection.md",
-    "ai_handoff.md",
-    "evidence_graph.json",
-    "graph_summary.md",
-    "symbol_graph.json",
-    "symbol_graph.md",
-    "file_inventory.json",
-)
-
-
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[3]
-
-
-def _src_root() -> Path:
-    return _repo_root() / "src"
-
-
-def _python_env() -> dict[str, str]:
-    env = os.environ.copy()
-    current = env.get("PYTHONPATH", "")
-    src = str(_src_root())
-    env["PYTHONPATH"] = src if not current else src + os.pathsep + current
-    return env
-
-
-def _run_python_module(
-    args: list[str],
-    *,
-    cwd: Path,
-    timeout: int = 30,
-) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [sys.executable, "-m", "codebase_lens", *args],
-        cwd=cwd,
-        env=_python_env(),
-        text=True,
-        capture_output=True,
-        check=False,
-        timeout=timeout,
-    )
-
-
-def _load_cli_objects() -> tuple[Any, Any]:
-    from codebase_lens import cli
-
-    public_commands = getattr(cli, "PUBLIC_COMMANDS", None)
-    build_parser = getattr(cli, "build_parser", None)
-    if public_commands is None:
-        raise RuntimeError("codebase_lens.cli.PUBLIC_COMMANDS is missing.")
-    if build_parser is None:
-        raise RuntimeError("codebase_lens.cli.build_parser is missing.")
-    return public_commands, build_parser
-
-
-def _parser_subcommands(parser: argparse.ArgumentParser) -> tuple[str, ...]:
-    commands: set[str] = set()
-    for action in parser._actions:
-        if isinstance(action, argparse._SubParsersAction):
-            commands.update(str(name) for name in action.choices)
-    return tuple(sorted(commands))
-
-
-def inspect_public_command_surface() -> tuple[tuple[str, ...], tuple[str, ...], tuple[CommandSurfaceIssue, ...]]:
-    issues: list[CommandSurfaceIssue] = []
-
-    try:
-        public_commands_obj, build_parser = _load_cli_objects()
-    except Exception as exc:  # pragma: no cover - exercised by audit subprocess on failure
-        return (), (), (
-            CommandSurfaceIssue(
-                severity="error",
-                code="cli_import_failed",
-                message="Could not import CLI public command surface.",
-                details={"exception": repr(exc)},
-            ),
-        )
-
-    public_commands = tuple(sorted(str(command) for command in public_commands_obj))
-
-    try:
-        parser = build_parser()
-    except Exception as exc:
-        return public_commands, (), (
-            CommandSurfaceIssue(
-                severity="error",
-                code="build_parser_failed",
-                message="build_parser() raised an exception.",
-                details={"exception": repr(exc)},
-            ),
-        )
-
-    parser_commands = _parser_subcommands(parser)
-
-    missing_from_parser = sorted(set(public_commands) - set(parser_commands))
-    missing_from_public = sorted(set(parser_commands) - set(public_commands))
-
-    if missing_from_parser:
-        issues.append(
-            CommandSurfaceIssue(
-                severity="error",
-                code="public_command_missing_from_parser",
-                message="PUBLIC_COMMANDS contains commands that are not registered in argparse.",
-                details={"commands": missing_from_parser},
-            )
-        )
-
-    if missing_from_public:
-        issues.append(
-            CommandSurfaceIssue(
-                severity="error",
-                code="parser_command_missing_from_public_commands",
-                message="Argparse registers commands that are absent from PUBLIC_COMMANDS.",
-                details={"commands": missing_from_public},
-            )
-        )
-
-    if not public_commands:
-        issues.append(
-            CommandSurfaceIssue(
-                severity="error",
-                code="empty_public_commands",
-                message="PUBLIC_COMMANDS is empty.",
-            )
-        )
-
-    return public_commands, parser_commands, tuple(issues)
-
-
-def run_help_smoke_checks(public_commands: tuple[str, ...]) -> tuple[CommandSurfaceIssue, ...]:
-    issues: list[CommandSurfaceIssue] = []
-    root = _repo_root()
-
-    top = _run_python_module(["--help"], cwd=root, timeout=20)
-    if top.returncode != 0:
-        issues.append(
-            CommandSurfaceIssue(
-                severity="error",
-                code="top_level_help_failed",
-                message="Top-level CLI --help failed.",
-                details={"returncode": top.returncode, "stdout": top.stdout[-1000:], "stderr": top.stderr[-1000:]},
-            )
-        )
-    elif "usage:" not in top.stdout.lower():
-        issues.append(
-            CommandSurfaceIssue(
-                severity="error",
-                code="top_level_help_missing_usage",
-                message="Top-level CLI --help did not emit usage text.",
-                details={"stdout": top.stdout[:1000]},
-            )
-        )
-
-    for command in public_commands:
-        result = _run_python_module([command, "--help"], cwd=root, timeout=20)
-        if result.returncode != 0:
-            issues.append(
-                CommandSurfaceIssue(
-                    severity="error",
-                    code="subcommand_help_failed",
-                    message=f"Subcommand help failed for {command!r}.",
-                    details={
-                        "command": command,
-                        "returncode": result.returncode,
-                        "stdout": result.stdout[-1000:],
-                        "stderr": result.stderr[-1000:],
-                    },
-                )
-            )
-            continue
-
-        output = result.stdout.lower()
-        if "usage:" not in output:
-            issues.append(
-                CommandSurfaceIssue(
-                    severity="error",
-                    code="subcommand_help_missing_usage",
-                    message=f"Subcommand help for {command!r} did not emit usage text.",
-                    details={"command": command, "stdout": result.stdout[:1000]},
-                )
-            )
-
-    return tuple(issues)
-
-
-def _write_synthetic_external_repo(base: Path) -> Path:
-    repo = base / "external_target_repo"
-    package = repo / "src" / "demo_pkg"
-    tests = repo / "tests"
-    package.mkdir(parents=True, exist_ok=True)
-    tests.mkdir(parents=True, exist_ok=True)
-
-    (repo / "pyproject.toml").write_text(
-        "\n".join(
-            [
-                "[project]",
-                "name = 'demo-pkg'",
-                "version = '0.0.0'",
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-    # This must never execute. CBL should parse target code statically, not import it.
-    (package / "__init__.py").write_text(
-        "raise RuntimeError('CBL imported the target repository package')\n",
-        encoding="utf-8",
-    )
-
-    (package / "core.py").write_text(
-        "\n".join(
-            [
-                "from __future__ import annotations",
-                "",
-                "class Thing:",
-                "    def __init__(self, name: str) -> None:",
-                "        self.name = name",
-                "",
-                "def normalize_name(name: str) -> str:",
-                "    return name.strip().lower()",
-                "",
-                "def build_thing(name: str) -> Thing:",
-                "    return Thing(normalize_name(name))",
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-    (package / "cli.py").write_text(
-        "\n".join(
-            [
-                "from __future__ import annotations",
-                "",
-                "import argparse",
-                "from demo_pkg.core import build_thing",
-                "",
-                "def _run_build(raw: str) -> str:",
-                "    thing = build_thing(raw)",
-                "    return thing.name",
-                "",
-                "def build_parser() -> argparse.ArgumentParser:",
-                "    parser = argparse.ArgumentParser()",
-                "    sub = parser.add_subparsers(dest='command')",
-                "    build = sub.add_parser('build')",
-                "    build.set_defaults(handler=_run_build)",
-                "    return parser",
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-    (tests / "test_core.py").write_text(
-        "\n".join(
-            [
-                "from demo_pkg.core import normalize_name",
-                "",
-                "def test_normalize_name():",
-                "    assert normalize_name('  A  ') == 'a'",
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-    return repo
-
-
-def _graph_node_paths(evidence_graph_path: Path) -> list[str]:
-    if not evidence_graph_path.is_file():
-        return []
-
-    payload = json.loads(evidence_graph_path.read_text(encoding="utf-8"))
-    nodes = payload.get("nodes", [])
-    paths: list[str] = []
-    if isinstance(nodes, list):
-        for node in nodes:
-            if isinstance(node, dict) and isinstance(node.get("path"), str):
-                paths.append(node["path"])
-    return paths
-
-
-def run_external_repo_pack_check() -> tuple[dict[str, Any], tuple[CommandSurfaceIssue, ...]]:
-    issues: list[CommandSurfaceIssue] = []
-
-    with tempfile.TemporaryDirectory(prefix="cbl_command_surface_") as temp_dir:
-        workspace = Path(temp_dir)
-        target_repo = _write_synthetic_external_repo(workspace)
-        runner_cwd = workspace / "runner"
-        runner_cwd.mkdir(parents=True, exist_ok=True)
-
-        result = _run_python_module(
-            [
-                "pack",
-                "--repo",
-                str(target_repo),
-                "--issue",
-                "external repo command surface audit",
-                "--budget",
-                "12000",
-                "--no-archive",
-            ],
-            cwd=runner_cwd,
-            timeout=45,
-        )
-
-        latest = target_repo / ".codecontext" / "latest"
-        manifest_path = latest / "manifest.json"
-        projection_path = latest / "handoff_projection.json"
-        evidence_graph_path = latest / "evidence_graph.json"
-
-        external_report: dict[str, Any] = {
-            "target_repo": str(target_repo),
-            "runner_cwd": str(runner_cwd),
-            "returncode": result.returncode,
-            "latest_dir_exists": latest.is_dir(),
-            "manifest_exists": manifest_path.is_file(),
-            "projection_exists": projection_path.is_file(),
-            "evidence_graph_exists": evidence_graph_path.is_file(),
-            "missing_core_artifacts": [],
-            "scanned_codecontext_paths": [],
-            "projection_source_prefixes": [],
-            "stdout_tail": result.stdout[-1000:],
-            "stderr_tail": result.stderr[-1000:],
-        }
-
-        if result.returncode != 0:
-            issues.append(
-                CommandSurfaceIssue(
-                    severity="error",
-                    code="external_repo_pack_failed",
-                    message="cbl pack --repo failed from outside the target repository.",
-                    details=external_report,
-                )
-            )
-            return external_report, tuple(issues)
-
-        missing = [
-            artifact
-            for artifact in CORE_EXTERNAL_PACK_ARTIFACTS
-            if not (latest / artifact).is_file()
-        ]
-        external_report["missing_core_artifacts"] = missing
-        if missing:
-            issues.append(
-                CommandSurfaceIssue(
-                    severity="error",
-                    code="external_repo_pack_missing_artifacts",
-                    message="External repo pack did not write all core latest/ artifacts.",
-                    details={"missing": missing},
-                )
-            )
-
-        scanned_codecontext = [
-            path
-            for path in _graph_node_paths(evidence_graph_path)
-            if path.startswith(".codecontext/") or "/.codecontext/" in path or "\\.codecontext\\" in path
-        ]
-        external_report["scanned_codecontext_paths"] = scanned_codecontext
-        if scanned_codecontext:
-            issues.append(
-                CommandSurfaceIssue(
-                    severity="error",
-                    code="codecontext_recursively_scanned",
-                    message=".codecontext was scanned as target source in the external repo pack.",
-                    details={"paths": scanned_codecontext[:20]},
-                )
-            )
-
-        if projection_path.is_file():
-            projection = json.loads(projection_path.read_text(encoding="utf-8"))
-            prefixes = projection.get("project_profile", {}).get("source_prefixes", [])
-            external_report["projection_source_prefixes"] = prefixes
-            if "src/demo_pkg/" not in prefixes:
-                issues.append(
-                    CommandSurfaceIssue(
-                        severity="error",
-                        code="external_repo_source_prefix_not_inferred",
-                        message="External repo projection did not infer the synthetic package source prefix.",
-                        details={"source_prefixes": prefixes},
-                    )
-                )
-
-            projection_blob = json.dumps(projection, sort_keys=True)
-            if "CBL imported the target repository package" in projection_blob:
-                issues.append(
-                    CommandSurfaceIssue(
-                        severity="error",
-                        code="target_repo_import_side_effect_seen",
-                        message="Projection contains the target import side-effect marker.",
-                    )
-                )
-
-    return external_report, tuple(issues)
-
-
-def audit_command_surface(*, include_help: bool = True, include_external_pack: bool = True) -> CommandSurfaceAuditResult:
-    public_commands, parser_commands, parity_issues = inspect_public_command_surface()
-    issues: list[CommandSurfaceIssue] = list(parity_issues)
-    external_repo: dict[str, Any] = {}
-
-    if include_help:
-        issues.extend(run_help_smoke_checks(public_commands))
-
-    if include_external_pack:
-        external_repo, external_issues = run_external_repo_pack_check()
-        issues.extend(external_issues)
-
-    ok = not any(issue.severity == "error" for issue in issues)
-
-    return CommandSurfaceAuditResult(
-        ok=ok,
-        public_commands=public_commands,
-        parser_subcommands=parser_commands,
-        issues=tuple(issues),
-        external_repo=external_repo,
-    )
-
-
-def command_surface_result_payload(result: CommandSurfaceAuditResult) -> dict[str, Any]:
-    return {
-        "schema": {
-            "name": "cbl.command_surface_audit",
-            "version": 1,
-        },
-        "ok": result.ok,
-        "public_commands": list(result.public_commands),
-        "parser_subcommands": list(result.parser_subcommands),
-        "counts": {
-            "public_commands": len(result.public_commands),
-            "parser_subcommands": len(result.parser_subcommands),
-            "issues": len(result.issues),
-            "errors": sum(1 for issue in result.issues if issue.severity == "error"),
-            "warnings": sum(1 for issue in result.issues if issue.severity == "warning"),
-        },
-        "issues": [asdict(issue) for issue in result.issues],
-        "external_repo": result.external_repo,
-    }
-
-
-def write_command_surface_audit_report(path: str | Path, result: CommandSurfaceAuditResult) -> None:
-    destination = Path(path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(
-        json.dumps(command_surface_result_payload(result), indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
 
 
 
@@ -5092,6 +4603,17 @@ def builtin_cbl_contract() -> dict[str, Any]:
             "scripts/dev/audits/audit_phase19_projection_roles_imports.py",
             "src/codebase_lens/contracts/command_surface.py",
             "scripts/dev/audits/audit_phase20_public_command_stability.py",
+            "src/codebase_lens/contracts/fixture_matrix.py",
+            "scripts/dev/audits/audit_phase21_release_fixture_matrix.py",
+            "src/codebase_lens/core/audit_artifacts.py",
+            "src/codebase_lens/contracts/release_safety.py",
+            "scripts/dev/audits/audit_phase22_release_safety.py",
+            "scripts/dev/audits/audit_phase23_audit_report_sanitization.py",
+            "README.md",
+            "docs/LOCAL_WORKFLOW.md",
+            "docs/AI_HANDOFF_WORKFLOW.md",
+            "docs/RELEASE_CHECKLIST.md",
+            "scripts/dev/audits/audit_phase24_documentation_workflow.py",
 ],
         "required_symbols": [
             {
@@ -5613,6 +5135,1818 @@ def evaluate_contract(repo_root: str | Path, spec: dict[str, Any] | None = None)
 
 
 ###############################################################################
+### FILE: codebase_lens/contracts/command_surface.py
+###############################################################################
+from __future__ import annotations
+
+import ast
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any
+
+
+@dataclass(frozen=True)
+class CommandSurfaceIssue:
+    severity: str
+    code: str
+    message: str
+    details: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class CommandSurfaceAuditResult:
+    ok: bool
+    public_commands: tuple[str, ...]
+    parser_subcommands: tuple[str, ...]
+    issues: tuple[CommandSurfaceIssue, ...]
+    external_repo: dict[str, Any]
+
+
+# These are mandatory artifacts for `cbl pack`.
+# Do not include command-specific artifacts such as `tree.md`, which belongs to
+# the tree-report command surface rather than the handoff pack contract.
+CORE_EXTERNAL_PACK_ARTIFACTS = (
+    "manifest.json",
+    "handoff_projection.json",
+    "handoff_projection.md",
+    "ai_handoff.md",
+    "evidence_graph.json",
+    "graph_summary.md",
+    "symbol_graph.json",
+    "symbol_graph.md",
+    "file_inventory.json",
+)
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[3]
+
+
+def _src_root() -> Path:
+    return _repo_root() / "src"
+
+
+def _python_env() -> dict[str, str]:
+    env = os.environ.copy()
+    current = env.get("PYTHONPATH", "")
+    src = str(_src_root())
+    env["PYTHONPATH"] = src if not current else src + os.pathsep + current
+    return env
+
+
+def _run_python_module(
+    args: list[str],
+    *,
+    cwd: Path,
+    timeout: int = 30,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-m", "codebase_lens", *args],
+        cwd=cwd,
+        env=_python_env(),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=timeout,
+    )
+
+
+
+
+
+
+
+
+def _read_source(relative_path: str) -> str:
+    return (_repo_root() / relative_path).read_text(encoding="utf-8")
+
+
+def _literal_string(node: ast.AST | None) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def _public_commands_from_constants_source() -> tuple[str, ...]:
+    text = _read_source("src/codebase_lens/core/constants.py")
+    tree = ast.parse(text, filename="src/codebase_lens/core/constants.py")
+
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+
+        if not any(isinstance(target, ast.Name) and target.id == "PUBLIC_COMMANDS" for target in node.targets):
+            continue
+
+        if not isinstance(node.value, (ast.Tuple, ast.List)):
+            raise RuntimeError("PUBLIC_COMMANDS must be a literal tuple or list of strings.")
+
+        values: list[str] = []
+        for item in node.value.elts:
+            literal = _literal_string(item)
+            if literal is None:
+                raise RuntimeError("PUBLIC_COMMANDS contains a non-literal or non-string item.")
+            values.append(literal)
+
+        return tuple(sorted(values))
+
+    raise RuntimeError("PUBLIC_COMMANDS assignment not found in src/codebase_lens/core/constants.py.")
+
+
+def _parser_subcommands_from_cli_source() -> tuple[str, ...]:
+    text = _read_source("src/codebase_lens/cli.py")
+    tree = ast.parse(text, filename="src/codebase_lens/cli.py")
+
+    commands: set[str] = set()
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+
+        func = node.func
+        if not isinstance(func, ast.Attribute):
+            continue
+
+        if func.attr != "add_parser":
+            continue
+
+        if not node.args:
+            continue
+
+        command_name = _literal_string(node.args[0])
+        if command_name:
+            commands.add(command_name)
+
+    return tuple(sorted(commands))
+
+
+def inspect_public_command_surface() -> tuple[tuple[str, ...], tuple[str, ...], tuple[CommandSurfaceIssue, ...]]:
+    issues: list[CommandSurfaceIssue] = []
+
+    try:
+        public_commands = _public_commands_from_constants_source()
+    except Exception as exc:
+        return (), (), (
+            CommandSurfaceIssue(
+                severity="error",
+                code="public_commands_static_parse_failed",
+                message="Could not statically parse PUBLIC_COMMANDS.",
+                details={"exception": repr(exc)},
+            ),
+        )
+
+    try:
+        parser_commands = _parser_subcommands_from_cli_source()
+    except Exception as exc:
+        return public_commands, (), (
+            CommandSurfaceIssue(
+                severity="error",
+                code="parser_commands_static_parse_failed",
+                message="Could not statically parse argparse subcommands from cli.py.",
+                details={"exception": repr(exc)},
+            ),
+        )
+
+    missing_from_parser = sorted(set(public_commands) - set(parser_commands))
+    missing_from_public = sorted(set(parser_commands) - set(public_commands))
+
+    if missing_from_parser:
+        issues.append(
+            CommandSurfaceIssue(
+                severity="error",
+                code="public_command_missing_from_parser",
+                message="PUBLIC_COMMANDS contains commands that are not registered in argparse.",
+                details={"commands": missing_from_parser},
+            )
+        )
+
+    if missing_from_public:
+        issues.append(
+            CommandSurfaceIssue(
+                severity="error",
+                code="parser_command_missing_from_public_commands",
+                message="Argparse registers commands that are absent from PUBLIC_COMMANDS.",
+                details={"commands": missing_from_public},
+            )
+        )
+
+    if not public_commands:
+        issues.append(
+            CommandSurfaceIssue(
+                severity="error",
+                code="empty_public_commands",
+                message="PUBLIC_COMMANDS is empty.",
+            )
+        )
+
+    return public_commands, parser_commands, tuple(issues)
+
+def run_help_smoke_checks(public_commands: tuple[str, ...]) -> tuple[CommandSurfaceIssue, ...]:
+    issues: list[CommandSurfaceIssue] = []
+    root = _repo_root()
+
+    top = _run_python_module(["--help"], cwd=root, timeout=20)
+    if top.returncode != 0:
+        issues.append(
+            CommandSurfaceIssue(
+                severity="error",
+                code="top_level_help_failed",
+                message="Top-level CLI --help failed.",
+                details={"returncode": top.returncode, "stdout": top.stdout[-1000:], "stderr": top.stderr[-1000:]},
+            )
+        )
+    elif "usage:" not in top.stdout.lower():
+        issues.append(
+            CommandSurfaceIssue(
+                severity="error",
+                code="top_level_help_missing_usage",
+                message="Top-level CLI --help did not emit usage text.",
+                details={"stdout": top.stdout[:1000]},
+            )
+        )
+
+    for command in public_commands:
+        result = _run_python_module([command, "--help"], cwd=root, timeout=20)
+        if result.returncode != 0:
+            issues.append(
+                CommandSurfaceIssue(
+                    severity="error",
+                    code="subcommand_help_failed",
+                    message=f"Subcommand help failed for {command!r}.",
+                    details={
+                        "command": command,
+                        "returncode": result.returncode,
+                        "stdout": result.stdout[-1000:],
+                        "stderr": result.stderr[-1000:],
+                    },
+                )
+            )
+            continue
+
+        output = result.stdout.lower()
+        if "usage:" not in output:
+            issues.append(
+                CommandSurfaceIssue(
+                    severity="error",
+                    code="subcommand_help_missing_usage",
+                    message=f"Subcommand help for {command!r} did not emit usage text.",
+                    details={"command": command, "stdout": result.stdout[:1000]},
+                )
+            )
+
+    return tuple(issues)
+
+
+def _write_synthetic_external_repo(base: Path) -> Path:
+    repo = base / "external_target_repo"
+    package = repo / "src" / "demo_pkg"
+    tests = repo / "tests"
+    package.mkdir(parents=True, exist_ok=True)
+    tests.mkdir(parents=True, exist_ok=True)
+
+    (repo / "pyproject.toml").write_text(
+        "\n".join(
+            [
+                "[project]",
+                "name = 'demo-pkg'",
+                "version = '0.0.0'",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    # This must never execute. CBL should parse target code statically, not import it.
+    (package / "__init__.py").write_text(
+        "raise RuntimeError('CBL imported the target repository package')\n",
+        encoding="utf-8",
+    )
+
+    (package / "core.py").write_text(
+        "\n".join(
+            [
+                "from __future__ import annotations",
+                "",
+                "class Thing:",
+                "    def __init__(self, name: str) -> None:",
+                "        self.name = name",
+                "",
+                "def normalize_name(name: str) -> str:",
+                "    return name.strip().lower()",
+                "",
+                "def build_thing(name: str) -> Thing:",
+                "    return Thing(normalize_name(name))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    (package / "cli.py").write_text(
+        "\n".join(
+            [
+                "from __future__ import annotations",
+                "",
+                "import argparse",
+                "from demo_pkg.core import build_thing",
+                "",
+                "def _run_build(raw: str) -> str:",
+                "    thing = build_thing(raw)",
+                "    return thing.name",
+                "",
+                "def build_parser() -> argparse.ArgumentParser:",
+                "    parser = argparse.ArgumentParser()",
+                "    sub = parser.add_subparsers(dest='command')",
+                "    build = sub.add_parser('build')",
+                "    build.set_defaults(handler=_run_build)",
+                "    return parser",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    (tests / "test_core.py").write_text(
+        "\n".join(
+            [
+                "from demo_pkg.core import normalize_name",
+                "",
+                "def test_normalize_name():",
+                "    assert normalize_name('  A  ') == 'a'",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    return repo
+
+
+def _graph_node_paths(evidence_graph_path: Path) -> list[str]:
+    if not evidence_graph_path.is_file():
+        return []
+
+    payload = json.loads(evidence_graph_path.read_text(encoding="utf-8"))
+    nodes = payload.get("nodes", [])
+    paths: list[str] = []
+    if isinstance(nodes, list):
+        for node in nodes:
+            if isinstance(node, dict) and isinstance(node.get("path"), str):
+                paths.append(node["path"])
+    return paths
+
+
+def run_external_repo_pack_check() -> tuple[dict[str, Any], tuple[CommandSurfaceIssue, ...]]:
+    issues: list[CommandSurfaceIssue] = []
+
+    with tempfile.TemporaryDirectory(prefix="cbl_command_surface_") as temp_dir:
+        workspace = Path(temp_dir)
+        target_repo = _write_synthetic_external_repo(workspace)
+        runner_cwd = workspace / "runner"
+        runner_cwd.mkdir(parents=True, exist_ok=True)
+
+        result = _run_python_module(
+            [
+                "pack",
+                "--repo",
+                str(target_repo),
+                "--issue",
+                "external repo command surface audit",
+                "--budget",
+                "12000",
+                "--no-archive",
+            ],
+            cwd=runner_cwd,
+            timeout=45,
+        )
+
+        latest = target_repo / ".codecontext" / "latest"
+        manifest_path = latest / "manifest.json"
+        projection_path = latest / "handoff_projection.json"
+        evidence_graph_path = latest / "evidence_graph.json"
+
+        external_report: dict[str, Any] = {
+            "target_repo": str(target_repo),
+            "runner_cwd": str(runner_cwd),
+            "returncode": result.returncode,
+            "latest_dir_exists": latest.is_dir(),
+            "manifest_exists": manifest_path.is_file(),
+            "projection_exists": projection_path.is_file(),
+            "evidence_graph_exists": evidence_graph_path.is_file(),
+            "missing_core_artifacts": [],
+            "scanned_codecontext_paths": [],
+            "projection_source_prefixes": [],
+            "stdout_tail": result.stdout[-1000:],
+            "stderr_tail": result.stderr[-1000:],
+        }
+
+        if result.returncode != 0:
+            issues.append(
+                CommandSurfaceIssue(
+                    severity="error",
+                    code="external_repo_pack_failed",
+                    message="cbl pack --repo failed from outside the target repository.",
+                    details=external_report,
+                )
+            )
+            return external_report, tuple(issues)
+
+        missing = [
+            artifact
+            for artifact in CORE_EXTERNAL_PACK_ARTIFACTS
+            if not (latest / artifact).is_file()
+        ]
+        external_report["missing_core_artifacts"] = missing
+        if missing:
+            issues.append(
+                CommandSurfaceIssue(
+                    severity="error",
+                    code="external_repo_pack_missing_artifacts",
+                    message="External repo pack did not write all core latest/ artifacts.",
+                    details={"missing": missing},
+                )
+            )
+
+        scanned_codecontext = [
+            path
+            for path in _graph_node_paths(evidence_graph_path)
+            if path.startswith(".codecontext/") or "/.codecontext/" in path or "\\.codecontext\\" in path
+        ]
+        external_report["scanned_codecontext_paths"] = scanned_codecontext
+        if scanned_codecontext:
+            issues.append(
+                CommandSurfaceIssue(
+                    severity="error",
+                    code="codecontext_recursively_scanned",
+                    message=".codecontext was scanned as target source in the external repo pack.",
+                    details={"paths": scanned_codecontext[:20]},
+                )
+            )
+
+        if projection_path.is_file():
+            projection = json.loads(projection_path.read_text(encoding="utf-8"))
+            prefixes = projection.get("project_profile", {}).get("source_prefixes", [])
+            external_report["projection_source_prefixes"] = prefixes
+            if "src/demo_pkg/" not in prefixes:
+                issues.append(
+                    CommandSurfaceIssue(
+                        severity="error",
+                        code="external_repo_source_prefix_not_inferred",
+                        message="External repo projection did not infer the synthetic package source prefix.",
+                        details={"source_prefixes": prefixes},
+                    )
+                )
+
+            projection_blob = json.dumps(projection, sort_keys=True)
+            if "CBL imported the target repository package" in projection_blob:
+                issues.append(
+                    CommandSurfaceIssue(
+                        severity="error",
+                        code="target_repo_import_side_effect_seen",
+                        message="Projection contains the target import side-effect marker.",
+                    )
+                )
+
+    return external_report, tuple(issues)
+
+
+def audit_command_surface(*, include_help: bool = True, include_external_pack: bool = True) -> CommandSurfaceAuditResult:
+    public_commands, parser_commands, parity_issues = inspect_public_command_surface()
+    issues: list[CommandSurfaceIssue] = list(parity_issues)
+    external_repo: dict[str, Any] = {}
+
+    if include_help:
+        issues.extend(run_help_smoke_checks(public_commands))
+
+    if include_external_pack:
+        external_repo, external_issues = run_external_repo_pack_check()
+        issues.extend(external_issues)
+
+    ok = not any(issue.severity == "error" for issue in issues)
+
+    return CommandSurfaceAuditResult(
+        ok=ok,
+        public_commands=public_commands,
+        parser_subcommands=parser_commands,
+        issues=tuple(issues),
+        external_repo=external_repo,
+    )
+
+
+def command_surface_result_payload(result: CommandSurfaceAuditResult) -> dict[str, Any]:
+    return {
+        "schema": {
+            "name": "cbl.command_surface_audit",
+            "version": 1,
+        },
+        "ok": result.ok,
+        "public_commands": list(result.public_commands),
+        "parser_subcommands": list(result.parser_subcommands),
+        "counts": {
+            "public_commands": len(result.public_commands),
+            "parser_subcommands": len(result.parser_subcommands),
+            "issues": len(result.issues),
+            "errors": sum(1 for issue in result.issues if issue.severity == "error"),
+            "warnings": sum(1 for issue in result.issues if issue.severity == "warning"),
+        },
+        "issues": [asdict(issue) for issue in result.issues],
+        "external_repo": result.external_repo,
+    }
+
+
+def write_command_surface_audit_report(path: str | Path, result: CommandSurfaceAuditResult) -> None:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(
+        json.dumps(command_surface_result_payload(result), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+
+###############################################################################
+### FILE: codebase_lens/contracts/fixture_matrix.py
+###############################################################################
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Callable
+
+
+@dataclass(frozen=True)
+class FixtureIssue:
+    severity: str
+    code: str
+    message: str
+    fixture: str
+    details: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class FixtureCaseResult:
+    name: str
+    ok: bool
+    skipped: bool
+    command: tuple[str, ...]
+    returncode: int | None
+    duration_seconds: float
+    counts: dict[str, Any]
+    source_prefixes: tuple[str, ...]
+    issues: tuple[FixtureIssue, ...]
+
+
+@dataclass(frozen=True)
+class FixtureMatrixResult:
+    ok: bool
+    cases: tuple[FixtureCaseResult, ...]
+    issues: tuple[FixtureIssue, ...]
+    counts: dict[str, int]
+
+
+PACK_REQUIRED_ARTIFACTS = (
+    "manifest.json",
+    "handoff_projection.json",
+    "handoff_projection.md",
+    "ai_handoff.md",
+    "evidence_graph.json",
+    "graph_summary.md",
+    "symbol_graph.json",
+    "symbol_graph.md",
+    "file_inventory.json",
+)
+
+
+RAW_SECRET_MARKERS = (
+    "sk-live-fixture-secret",
+    "fixture-password-123",
+    "fixture-token-abc",
+)
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[3]
+
+
+def _src_root() -> Path:
+    return _repo_root() / "src"
+
+
+def _python_env() -> dict[str, str]:
+    env = os.environ.copy()
+    current = env.get("PYTHONPATH", "")
+    src = str(_src_root())
+    env["PYTHONPATH"] = src if not current else src + os.pathsep + current
+    return env
+
+
+def _run_cbl(args: list[str], *, cwd: Path, timeout: int = 60) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-m", "codebase_lens", *args],
+        cwd=cwd,
+        env=_python_env(),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=timeout,
+    )
+
+
+def _write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text.strip("\n") + "\n", encoding="utf-8", newline="\n")
+
+
+def _write_pyproject(repo: Path, package_name: str) -> None:
+    _write(
+        repo / "pyproject.toml",
+        "\n".join(
+            [
+                "[project]",
+                f"name = '{package_name.replace('_', '-')}'",
+                "version = '0.0.0'",
+                "",
+            ]
+        ),
+    )
+
+
+def _write_init_with_import_trap(package: Path) -> None:
+    _write(
+        package / "__init__.py",
+        "raise RuntimeError('CBL imported a fixture package instead of parsing it statically')",
+    )
+
+
+def _create_basic_package(repo: Path) -> dict[str, Any]:
+    package = repo / "src" / "basic_pkg"
+    tests = repo / "tests"
+    _write_pyproject(repo, "basic_pkg")
+    _write_init_with_import_trap(package)
+
+    _write(
+        package / "core.py",
+        """
+from __future__ import annotations
+
+class Item:
+    def __init__(self, name: str) -> None:
+        self.name = normalize_name(name)
+
+def normalize_name(name: str) -> str:
+    return name.strip().lower()
+
+def build_item(name: str) -> Item:
+    return Item(name)
+""",
+    )
+
+    _write(
+        package / "service.py",
+        """
+from __future__ import annotations
+
+from basic_pkg.core import Item, build_item
+
+def render_item(name: str) -> str:
+    item = build_item(name)
+    return f"item:{item.name}"
+""",
+    )
+
+    _write(
+        tests / "test_service.py",
+        """
+from basic_pkg.service import render_item
+
+def test_render_item():
+    assert render_item(" A ") == "item:a"
+""",
+    )
+
+    return {
+        "source_prefix": "src/basic_pkg/",
+        "min_symbols": 4,
+        "min_imports": 2,
+        "min_tests": 1,
+    }
+
+
+def _create_argparse_cli_package(repo: Path) -> dict[str, Any]:
+    package = repo / "src" / "cli_pkg"
+    _write_pyproject(repo, "cli_pkg")
+    _write_init_with_import_trap(package)
+
+    _write(
+        package / "handlers.py",
+        """
+from __future__ import annotations
+
+def build_value(raw: str) -> str:
+    return raw.strip().upper()
+
+def show_value(raw: str) -> str:
+    return f"value={build_value(raw)}"
+""",
+    )
+
+    _write(
+        package / "cli.py",
+        """
+from __future__ import annotations
+
+import argparse
+
+from cli_pkg.handlers import build_value, show_value
+
+def _run_build(raw: str) -> str:
+    return build_value(raw)
+
+def _run_show(raw: str) -> str:
+    return show_value(raw)
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command")
+
+    build = sub.add_parser("build")
+    build.set_defaults(handler=_run_build)
+
+    show = sub.add_parser("show")
+    show.set_defaults(handler=_run_show)
+
+    return parser
+""",
+    )
+
+    return {
+        "source_prefix": "src/cli_pkg/",
+        "min_symbols": 4,
+        "min_imports": 2,
+        "min_commands": 2,
+    }
+
+
+def _create_route_package(repo: Path) -> dict[str, Any]:
+    package = repo / "src" / "web_pkg"
+    _write_pyproject(repo, "web_pkg")
+    _write_init_with_import_trap(package)
+
+    _write(
+        package / "app.py",
+        """
+from __future__ import annotations
+
+class FakeApp:
+    def get(self, path: str):
+        def decorate(func):
+            return func
+        return decorate
+
+    def post(self, path: str):
+        def decorate(func):
+            return func
+        return decorate
+
+app = FakeApp()
+
+@app.get("/health")
+def health_check() -> dict[str, str]:
+    return {"status": "ok"}
+
+@app.post("/items")
+def create_item() -> dict[str, str]:
+    return {"created": "yes"}
+""",
+    )
+
+    return {
+        "source_prefix": "src/web_pkg/",
+        "min_symbols": 5,
+        "min_routes": 2,
+    }
+
+
+def _create_safety_redaction_package(repo: Path) -> dict[str, Any]:
+    package = repo / "src" / "safety_pkg"
+    _write_pyproject(repo, "safety_pkg")
+    _write_init_with_import_trap(package)
+
+    _write(
+        repo / ".env",
+        """
+OPENAI_API_KEY=sk-live-fixture-secret
+PASSWORD=fixture-password-123
+""",
+    )
+
+    _write(
+        package / "config.py",
+        """
+from __future__ import annotations
+
+API_KEY = "sk-live-fixture-secret"
+TOKEN = "fixture-token-abc"
+PASSWORD = "fixture-password-123"
+
+def public_config() -> dict[str, str]:
+    return {"mode": "test", "api_key": API_KEY}
+""",
+    )
+
+    return {
+        "source_prefix": "src/safety_pkg/",
+        "min_symbols": 1,
+        "forbid_raw_secrets": True,
+        "forbid_env_scan": True,
+    }
+
+
+def _create_codecontext_recursion_package(repo: Path) -> dict[str, Any]:
+    package = repo / "src" / "recursion_pkg"
+    poison = repo / ".codecontext" / "latest"
+    _write_pyproject(repo, "recursion_pkg")
+    _write_init_with_import_trap(package)
+
+    _write(
+        package / "core.py",
+        """
+from __future__ import annotations
+
+def live_function() -> str:
+    return "live"
+""",
+    )
+
+    _write(
+        poison / "poison.py",
+        """
+def poison_should_not_be_scanned():
+    return "poison"
+""",
+    )
+
+    _write(
+        poison / "poison.md",
+        """
+This .codecontext content must not be scanned as source.
+""",
+    )
+
+    return {
+        "source_prefix": "src/recursion_pkg/",
+        "min_symbols": 1,
+        "forbid_codecontext_scan": True,
+    }
+
+
+def _git_available() -> bool:
+    if shutil.which("git") is None:
+        return False
+    result = subprocess.run(
+        ["git", "--version"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def _run_git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def _create_git_changed_package(repo: Path) -> dict[str, Any]:
+    package = repo / "src" / "git_pkg"
+    _write_pyproject(repo, "git_pkg")
+    _write_init_with_import_trap(package)
+
+    _write(
+        package / "core.py",
+        """
+from __future__ import annotations
+
+def stable() -> str:
+    return "stable"
+""",
+    )
+
+    init = _run_git(repo, "init")
+    if init.returncode != 0:
+        return {"skip": True, "skip_reason": init.stderr or init.stdout or "git init failed"}
+
+    _run_git(repo, "config", "user.email", "fixture@example.invalid")
+    _run_git(repo, "config", "user.name", "CBL Fixture")
+    _run_git(repo, "add", ".")
+    commit = _run_git(repo, "commit", "-m", "initial fixture commit")
+    if commit.returncode != 0:
+        return {"skip": True, "skip_reason": commit.stderr or commit.stdout or "git commit failed"}
+
+    _write(
+        package / "core.py",
+        """
+from __future__ import annotations
+
+def stable() -> str:
+    return "changed"
+
+def new_changed_symbol() -> str:
+    return stable()
+""",
+    )
+
+    _write(
+        package / "new_file.py",
+        """
+from __future__ import annotations
+
+def untracked_symbol() -> str:
+    return "untracked"
+""",
+    )
+
+    return {
+        "source_prefix": "src/git_pkg/",
+        "min_symbols": 2,
+        "changed_only": True,
+        "min_changed_files": 1,
+    }
+
+
+def _load_json(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    value = json.loads(path.read_text(encoding="utf-8"))
+    return value if isinstance(value, dict) else {}
+
+
+def _graph_node_paths(evidence_graph_path: Path) -> list[str]:
+    payload = _load_json(evidence_graph_path)
+    nodes = payload.get("nodes", [])
+    paths: list[str] = []
+
+    if isinstance(nodes, list):
+        for node in nodes:
+            if isinstance(node, dict) and isinstance(node.get("path"), str):
+                paths.append(node["path"])
+
+    return paths
+
+
+def _contains_codecontext_path(path: str) -> bool:
+    normalized = path.replace("\\", "/")
+    return normalized.startswith(".codecontext/") or "/.codecontext/" in normalized
+
+
+def _read_latest_text_blob(latest: Path) -> str:
+    values: list[str] = []
+    for name in (
+        "ai_handoff.md",
+        "handoff_projection.md",
+        "handoff_projection.json",
+        "manifest.json",
+        "file_inventory.json",
+        "evidence_graph.json",
+    ):
+        path = latest / name
+        if path.is_file():
+            values.append(path.read_text(encoding="utf-8", errors="replace"))
+    return "\n".join(values)
+
+
+def _validate_pack_outputs(
+    *,
+    fixture_name: str,
+    latest: Path,
+    expectations: dict[str, Any],
+) -> tuple[dict[str, Any], tuple[FixtureIssue, ...]]:
+    issues: list[FixtureIssue] = []
+    projection = _load_json(latest / "handoff_projection.json")
+    evidence_graph = _load_json(latest / "evidence_graph.json")
+
+    counts = projection.get("counts", {})
+    if not isinstance(counts, dict):
+        counts = {}
+
+    project_profile = projection.get("project_profile", {})
+    source_prefixes_raw = project_profile.get("source_prefixes", []) if isinstance(project_profile, dict) else []
+    source_prefixes = tuple(str(item) for item in source_prefixes_raw if isinstance(item, str))
+
+    missing = [name for name in PACK_REQUIRED_ARTIFACTS if not (latest / name).is_file()]
+    if missing:
+        issues.append(
+            FixtureIssue(
+                severity="error",
+                code="missing_pack_artifacts",
+                message="Fixture pack missed mandatory artifacts.",
+                fixture=fixture_name,
+                details={"missing": missing},
+            )
+        )
+
+    expected_prefix = expectations.get("source_prefix")
+    if isinstance(expected_prefix, str) and expected_prefix not in source_prefixes:
+        issues.append(
+            FixtureIssue(
+                severity="error",
+                code="source_prefix_not_inferred",
+                message="Projection did not infer the expected source prefix.",
+                fixture=fixture_name,
+                details={"expected": expected_prefix, "actual": list(source_prefixes)},
+            )
+        )
+
+    numeric_expectations = {
+        "min_symbols": "symbols",
+        "min_imports": "imports",
+        "min_commands": "commands",
+        "min_routes": "routes",
+        "min_tests": "test_functions",
+        "min_changed_files": "changed_files",
+    }
+    for expectation_key, count_key in numeric_expectations.items():
+        minimum = expectations.get(expectation_key)
+        if minimum is None:
+            continue
+        actual = int(counts.get(count_key) or 0)
+        if actual < int(minimum):
+            issues.append(
+                FixtureIssue(
+                    severity="error",
+                    code="count_below_expectation",
+                    message=f"Projection count {count_key!r} was below expectation.",
+                    fixture=fixture_name,
+                    details={"count": count_key, "minimum": int(minimum), "actual": actual},
+                )
+            )
+
+    node_paths = _graph_node_paths(latest / "evidence_graph.json")
+    scanned_codecontext = [path for path in node_paths if _contains_codecontext_path(path)]
+    if scanned_codecontext:
+        issues.append(
+            FixtureIssue(
+                severity="error",
+                code="codecontext_recursively_scanned",
+                message=".codecontext content was scanned as target source.",
+                fixture=fixture_name,
+                details={"paths": scanned_codecontext[:20]},
+            )
+        )
+
+    if expectations.get("forbid_env_scan"):
+        env_paths = [path for path in node_paths if path == ".env" or path.startswith(".env.")]
+        if env_paths:
+            issues.append(
+                FixtureIssue(
+                    severity="error",
+                    code="env_file_scanned",
+                    message="Hard-excluded .env content was scanned.",
+                    fixture=fixture_name,
+                    details={"paths": env_paths},
+                )
+            )
+
+    if expectations.get("forbid_raw_secrets"):
+        blob = _read_latest_text_blob(latest)
+        leaked = [marker for marker in RAW_SECRET_MARKERS if marker in blob]
+        if leaked:
+            issues.append(
+                FixtureIssue(
+                    severity="error",
+                    code="raw_secret_leaked",
+                    message="Raw fixture secret leaked into CBL outputs.",
+                    fixture=fixture_name,
+                    details={"markers": leaked},
+                )
+            )
+
+    if evidence_graph and not isinstance(evidence_graph.get("nodes"), list):
+        issues.append(
+            FixtureIssue(
+                severity="error",
+                code="malformed_evidence_graph",
+                message="Evidence graph JSON exists but nodes is not a list.",
+                fixture=fixture_name,
+            )
+        )
+
+    return {
+        "counts": dict(counts),
+        "source_prefixes": list(source_prefixes),
+    }, tuple(issues)
+
+
+FixtureCreator = Callable[[Path], dict[str, Any]]
+
+
+def _run_fixture_case(
+    *,
+    workspace: Path,
+    name: str,
+    creator: FixtureCreator,
+) -> FixtureCaseResult:
+    repo = workspace / name
+    repo.mkdir(parents=True, exist_ok=True)
+    expectations = creator(repo)
+
+    if expectations.get("skip"):
+        issue = FixtureIssue(
+            severity="warning",
+            code="fixture_skipped",
+            message=str(expectations.get("skip_reason") or "Fixture skipped."),
+            fixture=name,
+        )
+        return FixtureCaseResult(
+            name=name,
+            ok=True,
+            skipped=True,
+            command=(),
+            returncode=None,
+            duration_seconds=0.0,
+            counts={},
+            source_prefixes=(),
+            issues=(issue,),
+        )
+
+    runner = workspace / f"{name}_runner"
+    runner.mkdir(parents=True, exist_ok=True)
+
+    args = [
+        "pack",
+        "--repo",
+        str(repo),
+        "--issue",
+        f"release fixture matrix: {name}",
+        "--budget",
+        "16000",
+        "--no-archive",
+    ]
+    if expectations.get("changed_only"):
+        args.append("--changed")
+
+    started = time.perf_counter()
+    result = _run_cbl(args, cwd=runner, timeout=60)
+    duration = time.perf_counter() - started
+
+    issues: list[FixtureIssue] = []
+
+    if result.returncode != 0:
+        issues.append(
+            FixtureIssue(
+                severity="error",
+                code="pack_failed",
+                message="cbl pack failed for fixture repository.",
+                fixture=name,
+                details={
+                    "returncode": result.returncode,
+                    "stdout_tail": result.stdout[-1500:],
+                    "stderr_tail": result.stderr[-1500:],
+                },
+            )
+        )
+        return FixtureCaseResult(
+            name=name,
+            ok=False,
+            skipped=False,
+            command=tuple(args),
+            returncode=result.returncode,
+            duration_seconds=round(duration, 3),
+            counts={},
+            source_prefixes=(),
+            issues=tuple(issues),
+        )
+
+    latest = repo / ".codecontext" / "latest"
+    output_info, output_issues = _validate_pack_outputs(
+        fixture_name=name,
+        latest=latest,
+        expectations=expectations,
+    )
+    issues.extend(output_issues)
+
+    ok = not any(issue.severity == "error" for issue in issues)
+
+    return FixtureCaseResult(
+        name=name,
+        ok=ok,
+        skipped=False,
+        command=tuple(args),
+        returncode=result.returncode,
+        duration_seconds=round(duration, 3),
+        counts=dict(output_info.get("counts") or {}),
+        source_prefixes=tuple(output_info.get("source_prefixes") or ()),
+        issues=tuple(issues),
+    )
+
+
+def run_release_fixture_matrix(*, include_git_fixture: bool = True) -> FixtureMatrixResult:
+    creators: list[tuple[str, FixtureCreator]] = [
+        ("basic_package", _create_basic_package),
+        ("argparse_cli_package", _create_argparse_cli_package),
+        ("route_static_package", _create_route_package),
+        ("safety_redaction_package", _create_safety_redaction_package),
+        ("codecontext_recursion_package", _create_codecontext_recursion_package),
+    ]
+
+    if include_git_fixture:
+        if _git_available():
+            creators.append(("git_changed_package", _create_git_changed_package))
+        else:
+            def skipped_git(repo: Path) -> dict[str, Any]:
+                return {"skip": True, "skip_reason": "git executable is unavailable; git fixture skipped."}
+
+            creators.append(("git_changed_package", skipped_git))
+
+    with tempfile.TemporaryDirectory(prefix="cbl_release_fixture_matrix_") as temp_dir:
+        workspace = Path(temp_dir)
+        cases = tuple(
+            _run_fixture_case(workspace=workspace, name=name, creator=creator)
+            for name, creator in creators
+        )
+
+    issues = tuple(issue for case in cases for issue in case.issues)
+    ok = all(case.ok for case in cases) and not any(issue.severity == "error" for issue in issues)
+
+    return FixtureMatrixResult(
+        ok=ok,
+        cases=cases,
+        issues=issues,
+        counts={
+            "cases": len(cases),
+            "passed": sum(1 for case in cases if case.ok and not case.skipped),
+            "skipped": sum(1 for case in cases if case.skipped),
+            "failed": sum(1 for case in cases if not case.ok),
+            "issues": len(issues),
+            "errors": sum(1 for issue in issues if issue.severity == "error"),
+            "warnings": sum(1 for issue in issues if issue.severity == "warning"),
+        },
+    )
+
+
+def release_fixture_matrix_payload(result: FixtureMatrixResult) -> dict[str, Any]:
+    return {
+        "schema": {
+            "name": "cbl.release_fixture_matrix",
+            "version": 1,
+        },
+        "ok": result.ok,
+        "counts": dict(result.counts),
+        "cases": [asdict(case) for case in result.cases],
+        "issues": [asdict(issue) for issue in result.issues],
+    }
+
+
+def write_release_fixture_matrix_report(path: str | Path, result: FixtureMatrixResult) -> None:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(
+        json.dumps(release_fixture_matrix_payload(result), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+
+###############################################################################
+### FILE: codebase_lens/contracts/release_safety.py
+###############################################################################
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any
+
+
+@dataclass(frozen=True)
+class ReleaseSafetyIssue:
+    severity: str
+    code: str
+    message: str
+    details: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ReleaseSafetyAuditResult:
+    ok: bool
+    duration_seconds: float
+    issues: tuple[ReleaseSafetyIssue, ...]
+    counts: dict[str, int]
+    external_repo: dict[str, Any]
+
+
+RAW_SECRET_MARKERS = (
+    "sk-live-fixture-secret",
+    "fixture-password-123",
+    "fixture-token-abc",
+    "DATABASE_URL=postgres://fixture-secret",
+)
+
+AI_FACING_ARTIFACTS = (
+    "ai_handoff.md",
+    "handoff_projection.md",
+    "handoff_projection.json",
+    "graph_summary.md",
+    "symbol_graph.md",
+    "pack_index.json",
+    "snapshot_index.json",
+)
+
+PACK_REQUIRED_ARTIFACTS = (
+    "manifest.json",
+    "handoff_projection.json",
+    "handoff_projection.md",
+    "ai_handoff.md",
+    "evidence_graph.json",
+    "graph_summary.md",
+    "symbol_graph.json",
+    "symbol_graph.md",
+    "file_inventory.json",
+)
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[3]
+
+
+def _src_root() -> Path:
+    return _repo_root() / "src"
+
+
+def _python_env() -> dict[str, str]:
+    env = os.environ.copy()
+    current = env.get("PYTHONPATH", "")
+    src = str(_src_root())
+    env["PYTHONPATH"] = src if not current else src + os.pathsep + current
+    return env
+
+
+def _run_cbl(args: list[str], *, cwd: Path, timeout: int = 60) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-m", "codebase_lens", *args],
+        cwd=cwd,
+        env=_python_env(),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=timeout,
+    )
+
+
+def _write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text.strip("\n") + "\n", encoding="utf-8", newline="\n")
+
+
+def _write_bytes(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+
+
+def _create_hostile_repo(base: Path) -> Path:
+    repo = base / "hostile_safety_repo"
+    package = repo / "src" / "safety_pkg"
+
+    _write(
+        repo / "pyproject.toml",
+        """
+[project]
+name = 'safety-pkg'
+version = '0.0.0'
+""",
+    )
+
+    _write(
+        package / "__init__.py",
+        """
+raise RuntimeError('CBL imported a hostile fixture package instead of parsing it statically')
+""",
+    )
+
+    _write(
+        package / "core.py",
+        """
+from __future__ import annotations
+
+def normalize_name(name: str) -> str:
+    return name.strip().lower()
+
+def build_name(name: str) -> str:
+    return normalize_name(name)
+""",
+    )
+
+    _write(
+        package / "config.py",
+        """
+from __future__ import annotations
+
+API_KEY = "sk-live-fixture-secret"
+TOKEN = "fixture-token-abc"
+PASSWORD = "fixture-password-123"
+
+def public_config() -> dict[str, str]:
+    return {"mode": "test"}
+""",
+    )
+
+    _write(
+        repo / ".env",
+        """
+OPENAI_API_KEY=sk-live-fixture-secret
+PASSWORD=fixture-password-123
+DATABASE_URL=postgres://fixture-secret
+""",
+    )
+
+    _write(
+        repo / ".codecontext" / "latest" / "poison.py",
+        """
+def poison_should_not_be_scanned():
+    return "poison"
+""",
+    )
+
+    _write(
+        repo / ".codecontext" / "latest" / "poison.md",
+        """
+This previous-output file must not be recursively scanned.
+""",
+    )
+
+    _write(
+        repo / "data" / "raw" / "poison.py",
+        """
+def data_poison_should_not_be_scanned():
+    return "raw-data"
+""",
+    )
+
+    _write(
+        repo / "outputs" / "poison.py",
+        """
+def output_poison_should_not_be_scanned():
+    return "output"
+""",
+    )
+
+    _write(
+        repo / "node_modules" / "poison.py",
+        """
+def node_modules_poison_should_not_be_scanned():
+    return "node_modules"
+""",
+    )
+
+    _write(
+        package / "large_notes.md",
+        "LARGE FILE WITH SECRET sk-live-fixture-secret\n" + ("x" * 120_000),
+    )
+
+    _write_bytes(
+        package / "binary_payload.bin",
+        b"\x00\x01\x02sk-live-fixture-secret\x03\x04",
+    )
+
+    return repo
+
+
+def _load_json(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    value = json.loads(path.read_text(encoding="utf-8"))
+    return value if isinstance(value, dict) else {}
+
+
+def _graph_node_paths(evidence_graph_path: Path) -> list[str]:
+    payload = _load_json(evidence_graph_path)
+    nodes = payload.get("nodes", [])
+    paths: list[str] = []
+
+    if isinstance(nodes, list):
+        for node in nodes:
+            if isinstance(node, dict) and isinstance(node.get("path"), str):
+                paths.append(node["path"])
+
+    return paths
+
+
+def _inventory_paths(file_inventory_path: Path) -> list[str]:
+    payload = _load_json(file_inventory_path)
+    values: list[str] = []
+
+    def collect_from_items(items: Any) -> None:
+        if isinstance(items, list):
+            for item in items:
+                if isinstance(item, dict) and isinstance(item.get("path"), str):
+                    values.append(item["path"])
+
+    collect_from_items(payload.get("included_files"))
+    collect_from_items(payload.get("omitted_files"))
+    collect_from_items(payload.get("files"))
+    return values
+
+
+def _read_ai_facing_blob(latest: Path) -> str:
+    chunks: list[str] = []
+    for name in AI_FACING_ARTIFACTS:
+        path = latest / name
+        if path.is_file():
+            chunks.append(path.read_text(encoding="utf-8", errors="replace"))
+    return "\n".join(chunks)
+
+
+def _contains_forbidden_path(path: str) -> bool:
+    normalized = path.replace("\\", "/")
+    forbidden_prefixes = (
+        ".codecontext/",
+        "data/",
+        "raw/",
+        "processed/",
+        "outputs/",
+        "output/",
+        "node_modules/",
+    )
+    forbidden_names = {
+        ".env",
+        "binary_payload.bin",
+        "large_notes.md",
+    }
+
+    if normalized in forbidden_names:
+        return True
+
+    if any(normalized.startswith(prefix) for prefix in forbidden_prefixes):
+        return True
+
+    if "/.codecontext/" in normalized:
+        return True
+
+    return False
+
+
+def _validate_pack_outputs(repo: Path, workspace: Path) -> tuple[dict[str, Any], list[ReleaseSafetyIssue]]:
+    latest = repo / ".codecontext" / "latest"
+    issues: list[ReleaseSafetyIssue] = []
+
+    missing = [name for name in PACK_REQUIRED_ARTIFACTS if not (latest / name).is_file()]
+    if missing:
+        issues.append(
+            ReleaseSafetyIssue(
+                severity="error",
+                code="missing_pack_artifacts",
+                message="Safety pack missed mandatory handoff artifacts.",
+                details={"missing": missing},
+            )
+        )
+
+    projection = _load_json(latest / "handoff_projection.json")
+    prefixes = projection.get("project_profile", {}).get("source_prefixes", [])
+    if "src/safety_pkg/" not in prefixes:
+        issues.append(
+            ReleaseSafetyIssue(
+                severity="error",
+                code="source_prefix_not_inferred",
+                message="Safety fixture package source prefix was not inferred.",
+                details={"source_prefixes": prefixes},
+            )
+        )
+
+    graph_paths = _graph_node_paths(latest / "evidence_graph.json")
+    scanned_forbidden_paths = [path for path in graph_paths if _contains_forbidden_path(path)]
+    if scanned_forbidden_paths:
+        issues.append(
+            ReleaseSafetyIssue(
+                severity="error",
+                code="forbidden_paths_scanned_in_graph",
+                message="Hard-excluded paths appeared in the evidence graph.",
+                details={"paths": scanned_forbidden_paths[:30]},
+            )
+        )
+
+    inventory_paths = _inventory_paths(latest / "file_inventory.json")
+    included_forbidden_paths = [
+        path
+        for path in inventory_paths
+        if path in graph_paths and _contains_forbidden_path(path)
+    ]
+    if included_forbidden_paths:
+        issues.append(
+            ReleaseSafetyIssue(
+                severity="error",
+                code="forbidden_paths_included",
+                message="Hard-excluded paths were included in analyzable inventory.",
+                details={"paths": included_forbidden_paths[:30]},
+            )
+        )
+
+    blob = _read_ai_facing_blob(latest)
+    leaked_markers = [marker for marker in RAW_SECRET_MARKERS if marker in blob]
+    if leaked_markers:
+        issues.append(
+            ReleaseSafetyIssue(
+                severity="error",
+                code="raw_secret_leaked",
+                message="Raw fixture secret marker leaked into AI-facing artifacts.",
+                details={"markers": leaked_markers},
+            )
+        )
+
+    poison_markers = [
+        marker
+        for marker in (
+            "poison_should_not_be_scanned",
+            "data_poison_should_not_be_scanned",
+            "output_poison_should_not_be_scanned",
+            "node_modules_poison_should_not_be_scanned",
+        )
+        if marker in blob
+    ]
+    if poison_markers:
+        issues.append(
+            ReleaseSafetyIssue(
+                severity="error",
+                code="poison_output_leaked",
+                message="Hard-excluded poison code leaked into AI-facing artifacts.",
+                details={"markers": poison_markers},
+            )
+        )
+
+    normalized_workspace = str(workspace.resolve()).replace("\\", "/")
+    normalized_blob = blob.replace("\\", "/")
+    if normalized_workspace in normalized_blob:
+        issues.append(
+            ReleaseSafetyIssue(
+                severity="error",
+                code="absolute_workspace_path_leaked",
+                message="AI-facing artifacts leaked an absolute temp workspace path.",
+                details={"workspace": normalized_workspace},
+            )
+        )
+
+    counts = projection.get("counts", {}) if isinstance(projection.get("counts"), dict) else {}
+    if int(counts.get("symbols") or 0) < 2:
+        issues.append(
+            ReleaseSafetyIssue(
+                severity="error",
+                code="safety_fixture_not_analyzed",
+                message="Safety fixture did not produce enough Python symbol evidence.",
+                details={"counts": counts},
+            )
+        )
+
+    return {
+        "latest_dir": str(latest),
+        "source_prefixes": prefixes,
+        "graph_node_paths": graph_paths,
+        "counts": counts,
+        "missing_artifacts": missing,
+    }, issues
+
+
+def _validate_unsafe_path_rejection(repo: Path, workspace: Path, runner: Path) -> tuple[dict[str, Any], list[ReleaseSafetyIssue]]:
+    outside = workspace / "outside_secret.txt"
+    _write(outside, "OUTSIDE_SECRET=fixture-password-123")
+
+    result = _run_cbl(
+        [
+            "file",
+            "--repo",
+            str(repo),
+            "../outside_secret.txt",
+            "--no-archive",
+        ],
+        cwd=runner,
+        timeout=30,
+    )
+
+    details = {
+        "returncode": result.returncode,
+        "stdout_tail": result.stdout[-1000:],
+        "stderr_tail": result.stderr[-1000:],
+    }
+
+    if result.returncode == 0:
+        return details, [
+            ReleaseSafetyIssue(
+                severity="error",
+                code="unsafe_path_not_rejected",
+                message="cbl file accepted a path escaping the repository root.",
+                details=details,
+            )
+        ]
+
+    return details, []
+
+
+def run_release_safety_audit() -> ReleaseSafetyAuditResult:
+    started = time.perf_counter()
+    issues: list[ReleaseSafetyIssue] = []
+    external_repo_report: dict[str, Any] = {}
+
+    with tempfile.TemporaryDirectory(prefix="cbl_release_safety_") as temp_dir:
+        workspace = Path(temp_dir)
+        repo = _create_hostile_repo(workspace)
+        runner = workspace / "runner"
+        runner.mkdir(parents=True, exist_ok=True)
+
+        pack_result = _run_cbl(
+            [
+                "pack",
+                "--repo",
+                str(repo),
+                "--issue",
+                "release safety audit hostile fixture",
+                "--budget",
+                "16000",
+                "--max-file-bytes",
+                "4096",
+                "--no-archive",
+            ],
+            cwd=runner,
+            timeout=60,
+        )
+
+        external_repo_report = {
+            "target_repo": str(repo),
+            "runner_cwd": str(runner),
+            "pack_returncode": pack_result.returncode,
+            "pack_stdout_tail": pack_result.stdout[-1200:],
+            "pack_stderr_tail": pack_result.stderr[-1200:],
+        }
+
+        if pack_result.returncode != 0:
+            issues.append(
+                ReleaseSafetyIssue(
+                    severity="error",
+                    code="hostile_fixture_pack_failed",
+                    message="cbl pack failed for hostile safety fixture.",
+                    details=external_repo_report,
+                )
+            )
+        else:
+            output_report, output_issues = _validate_pack_outputs(repo, workspace)
+            external_repo_report.update(output_report)
+            issues.extend(output_issues)
+
+        unsafe_report, unsafe_issues = _validate_unsafe_path_rejection(repo, workspace, runner)
+        external_repo_report["unsafe_path_check"] = unsafe_report
+        issues.extend(unsafe_issues)
+
+    duration = round(time.perf_counter() - started, 3)
+    ok = not any(issue.severity == "error" for issue in issues)
+
+    return ReleaseSafetyAuditResult(
+        ok=ok,
+        duration_seconds=duration,
+        issues=tuple(issues),
+        counts={
+            "issues": len(issues),
+            "errors": sum(1 for issue in issues if issue.severity == "error"),
+            "warnings": sum(1 for issue in issues if issue.severity == "warning"),
+        },
+        external_repo=external_repo_report,
+    )
+
+
+def release_safety_audit_payload(result: ReleaseSafetyAuditResult) -> dict[str, Any]:
+    return {
+        "schema": {
+            "name": "cbl.release_safety_audit",
+            "version": 1,
+        },
+        "ok": result.ok,
+        "duration_seconds": result.duration_seconds,
+        "counts": dict(result.counts),
+        "issues": [asdict(issue) for issue in result.issues],
+        "external_repo": result.external_repo,
+    }
+
+
+
+###############################################################################
 ### FILE: codebase_lens/contracts/schema.py
 ###############################################################################
 """Reserved module boundary for CBL. Implementation arrives in later slices."""
@@ -5623,6 +6957,187 @@ def evaluate_contract(repo_root: str | Path, spec: dict[str, Any] | None = None)
 ### FILE: codebase_lens/core/__init__.py
 ###############################################################################
 """Core primitives for CBL."""
+
+
+
+###############################################################################
+### FILE: codebase_lens/core/audit_artifacts.py
+###############################################################################
+from __future__ import annotations
+
+import json
+import os
+import re
+import tempfile
+from pathlib import Path
+from typing import Any
+
+
+WINDOWS_TEMP_RE = re.compile(
+    r"(?i)[A-Z]:\\Users\\[^\\/\r\n\t\"']+\\AppData\\Local\\Temp(?:\\[^,\r\n\"']*)?"
+)
+WINDOWS_USER_RE = re.compile(
+    r"(?i)[A-Z]:\\Users\\[^\\/\r\n\t\"']+"
+)
+POSIX_TEMP_RE = re.compile(
+    r"(?:(?:/tmp|/var/tmp|/private/var/folders)/[^,\r\n\"']*)"
+)
+
+
+def _safe_audit_name(name: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", name.strip())
+    cleaned = cleaned.strip("._-")
+    if not cleaned:
+        raise ValueError("Audit artifact name cannot be empty.")
+    if not cleaned.endswith(".json"):
+        cleaned += ".json"
+    return cleaned
+
+
+def stable_audit_dir(repo_root: str | Path) -> Path:
+    return Path(repo_root).resolve() / ".codecontext" / "audits"
+
+
+def latest_dir(repo_root: str | Path) -> Path:
+    return Path(repo_root).resolve() / ".codecontext" / "latest"
+
+
+def _path_text_variants(path: str | Path | None) -> tuple[str, ...]:
+    if path is None:
+        return ()
+
+    raw = str(path)
+    if not raw:
+        return ()
+
+    variants = {
+        raw,
+        raw.replace("\\", "/"),
+        raw.replace("/", "\\"),
+    }
+
+    try:
+        resolved = str(Path(raw).expanduser().resolve(strict=False))
+        variants.add(resolved)
+        variants.add(resolved.replace("\\", "/"))
+        variants.add(resolved.replace("/", "\\"))
+    except OSError:
+        pass
+
+    return tuple(sorted((item for item in variants if item), key=len, reverse=True))
+
+
+def _specific_sensitive_path_replacements() -> tuple[tuple[str, str], ...]:
+    candidates: list[tuple[str, str]] = []
+
+    for value, placeholder in (
+        (tempfile.gettempdir(), "<TEMP_DIR>"),
+        (os.environ.get("TMP"), "<TEMP_DIR>"),
+        (os.environ.get("TEMP"), "<TEMP_DIR>"),
+        (os.environ.get("USERPROFILE"), "<USER_HOME>"),
+        (os.environ.get("HOME"), "<USER_HOME>"),
+        (Path.home(), "<USER_HOME>"),
+    ):
+        for variant in _path_text_variants(value):
+            candidates.append((variant, placeholder))
+
+    deduped: dict[str, str] = {}
+    for needle, placeholder in sorted(candidates, key=lambda item: len(item[0]), reverse=True):
+        deduped.setdefault(needle, placeholder)
+
+    return tuple(deduped.items())
+
+
+def sanitize_audit_string(value: str) -> str:
+    sanitized = value
+
+    for needle, placeholder in _specific_sensitive_path_replacements():
+        if needle:
+            sanitized = sanitized.replace(needle, placeholder)
+
+    sanitized = WINDOWS_TEMP_RE.sub("<TEMP_DIR>", sanitized)
+    sanitized = POSIX_TEMP_RE.sub("<TEMP_DIR>", sanitized)
+    sanitized = WINDOWS_USER_RE.sub("<USER_HOME>", sanitized)
+
+    return sanitized
+
+
+def sanitize_audit_payload(value: Any) -> Any:
+    if isinstance(value, str):
+        return sanitize_audit_string(value)
+
+    if isinstance(value, Path):
+        return sanitize_audit_string(str(value))
+
+    if isinstance(value, dict):
+        return {
+            str(key): sanitize_audit_payload(item)
+            for key, item in value.items()
+        }
+
+    if isinstance(value, list):
+        return [sanitize_audit_payload(item) for item in value]
+
+    if isinstance(value, tuple):
+        return [sanitize_audit_payload(item) for item in value]
+
+    if isinstance(value, set):
+        return sorted(sanitize_audit_payload(item) for item in value)
+
+    return value
+
+
+def audit_payload_contains_local_paths(value: Any) -> bool:
+    blob = json.dumps(value, sort_keys=True, ensure_ascii=False)
+
+    forbidden_fragments = [
+        "AppData\\\\Local\\\\Temp",
+        "AppData/Local/Temp",
+        "C:\\\\Users\\\\",
+        "C:/Users/",
+        "/tmp/",
+        "/var/tmp/",
+        "/private/var/folders/",
+    ]
+
+    home = str(Path.home())
+    temp_dir = tempfile.gettempdir()
+
+    for variant in [*_path_text_variants(home), *_path_text_variants(temp_dir)]:
+        if variant and variant in blob:
+            return True
+
+    return any(fragment in blob for fragment in forbidden_fragments)
+
+
+def write_stable_audit_report(repo_root: str | Path, name: str, payload: dict[str, Any]) -> Path:
+    destination = stable_audit_dir(repo_root) / _safe_audit_name(name)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    sanitized = sanitize_audit_payload(payload)
+    destination.write_text(
+        json.dumps(sanitized, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    return destination
+
+
+def write_latest_audit_report(repo_root: str | Path, name: str, payload: dict[str, Any]) -> Path:
+    destination = latest_dir(repo_root) / _safe_audit_name(name)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    sanitized = sanitize_audit_payload(payload)
+    destination.write_text(
+        json.dumps(sanitized, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    return destination
+
+
+def write_audit_report_pair(repo_root: str | Path, name: str, payload: dict[str, Any]) -> tuple[Path, Path]:
+    stable = write_stable_audit_report(repo_root, name, payload)
+    latest = write_latest_audit_report(repo_root, name, payload)
+    return stable, latest
 
 
 
