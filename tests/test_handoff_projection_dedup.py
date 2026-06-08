@@ -32,7 +32,7 @@ def test_projection_deduplicates_edges_and_balances_coverage() -> None:
     text = (latest / "handoff_projection.md").read_text(encoding="utf-8")
     payload = json.loads((latest / "handoff_projection.json").read_text(encoding="utf-8"))
 
-    assert payload["schema"]["version"] == 4
+    assert payload["schema"]["version"] >= 4
 
     edges = payload["graph"]["representative_edges"]
     assert edges

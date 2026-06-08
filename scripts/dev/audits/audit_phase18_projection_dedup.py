@@ -67,8 +67,9 @@ def main() -> int:
     graph = payload.get("graph", {})
     edges = graph.get("representative_edges", [])
 
-    if payload.get("schema", {}).get("version") != 4:
-        fail("handoff_projection schema version was not advanced to 4.")
+    schema_version = int(payload.get("schema", {}).get("version") or 0)
+    if schema_version < 4:
+        fail(f"handoff_projection schema version regressed below 4: {schema_version}")
 
     if not edges:
         fail("No representative edges emitted.")

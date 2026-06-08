@@ -388,15 +388,61 @@ def _path_role(path: str, profile: ProjectProfile) -> str:
     return "product"
 
 
-def _symbol_role(node: dict[str, Any], profile: ProjectProfile) -> str:
+def _is_cli_handler_label(label: str) -> bool:
+    return label.startswith("_run_")
+
+
+def _is_cli_entrypoint_label(label: str) -> bool:
+    return label in {"main", "build_parser", "create_parser", "make_parser"}
+
+
+def _is_cli_support_label(label: str) -> bool:
+    if label.startswith((
+        "_base_",
+        "_add_",
+        "_common_",
+        "_parser_",
+        "_parse_",
+        "_coerce_",
+        "_resolve_",
+        "_print_",
+        "_format_",
+        "_build_",
+    )):
+        return True
+
+    lowered = label.lower()
+    return any(term in lowered for term in {"arg", "option", "manifest", "namespace", "parser"})
+
+
+def _symbol_role(node: dict[str, Any] | None, profile: ProjectProfile) -> str:
+    if not isinstance(node, dict):
+        return "unknown"
+
     path = _node_path(node)
     label = _node_label(node)
+    kind = _node_kind(node)
     data = _node_data(node)
+
+    if kind == "cli_command":
+        return "cli_command"
+
+    if path in profile.cli_paths:
+        if kind == "file":
+            return "cli_surface"
+        if _is_cli_handler_label(label):
+            return "cli_handler"
+        if _is_cli_entrypoint_label(label):
+            return "cli_entrypoint"
+        if _is_cli_support_label(label):
+            return "cli_support"
+        if label.startswith("_"):
+            return "cli_support"
+        return "cli_support"
+
     blob = " ".join([path, label, str(data.get("signature", ""))]).lower()
     path_role = _path_role(path, profile)
 
-    if path_role == "cli_surface":
-        return "cli_surface"
     if _contains_any(blob, REPORTING_NAME_TERMS):
         return "reporting"
     if _contains_any(blob, ANALYSIS_NAME_TERMS):
@@ -517,20 +563,29 @@ def _edge_family(edge: dict[str, Any], source: dict[str, Any] | None, target: di
     kind = str(edge.get("kind") or "")
     source_role = _symbol_role(source, profile) if isinstance(source, dict) else "unknown"
     target_role = _symbol_role(target, profile) if isinstance(target, dict) else "unknown"
-    source_kind = _node_kind(source)
     target_kind = _node_kind(target)
     target_path = _node_path(target)
 
     if kind == "file_declares_cli_command" or target_kind == "cli_command":
         return "cli_to_handler"
 
-    if kind in {"file_imports_module", "module_resolves_to_file"}:
+    if kind in {"file_imports_module", "module_resolves_to_file", "internal_import_dependency"}:
         if target_path and _is_product_path(target_path, profile):
             return "import_dependency"
         return "external_import_dependency"
 
-    if source_role == "cli_surface" and target_role in {"analysis", "model_or_core", "io_or_safety", "product"}:
-        return "handler_to_analysis"
+    if source_role == "cli_entrypoint" and target_role in {"cli_handler", "cli_support", "cli_command"}:
+        return "cli_entrypoint_to_handler"
+
+    if source_role == "cli_handler" and target_role in {"analysis", "model_or_core", "io_or_safety", "product", "reporting"}:
+        return "cli_handler_to_analysis"
+
+    if source_role == "cli_support" and target_role in {"io_or_safety", "model_or_core", "reporting"}:
+        return "cli_support_to_io_or_config"
+
+    if source_role == "cli_support" and target_role in {"analysis", "product"}:
+        return "cli_support_to_analysis"
+
     if source_role in {"analysis", "product"} and target_role == "reporting":
         return "analysis_to_report"
     if source_role == "reporting" and target_role == "reporting":
@@ -549,20 +604,26 @@ def _edge_selection_reason(edge: dict[str, Any], family: str) -> str:
 
     if family == "cli_to_handler":
         return "connects command or route declaration to executable surface"
-    if family == "handler_to_analysis":
-        return "connects command-facing handler to analysis or product logic"
+    if family == "cli_entrypoint_to_handler":
+        return "connects CLI parser/entrypoint wiring to command handler surface"
+    if family == "cli_handler_to_analysis":
+        return "connects a concrete command handler to analysis or product logic"
+    if family == "cli_support_to_analysis":
+        return "connects CLI support/configuration helper to analysis logic"
+    if family == "cli_support_to_io_or_config":
+        return "connects CLI support/configuration helper to I/O, Git, or report configuration"
     if family == "analysis_to_report":
         return "connects analysis logic to report generation"
     if family == "report_to_output_writer":
         return "connects reporting layer to output writer or renderer"
     if family == "import_dependency":
-        return "shows internal project import or module dependency"
+        return "shows resolved internal project import dependency"
     if family == "external_import_dependency":
         return "shows external import dependency; normally omitted unless no internal alternatives exist"
     if family == "analysis_to_model":
         return "connects analysis logic to model or core structures"
     if family == "scanner_or_io_flow":
-        return "connects filesystem, scanner, safety, or I/O flow"
+        return "connects filesystem, scanner, safety, Git, or I/O flow"
     if kind == "file_contains_symbol":
         return "fallback declaration context for a product symbol"
     return "high-scoring product dependency edge"
@@ -591,6 +652,8 @@ def _edge_relevance_score(edge: dict[str, Any], nodes_by_id: dict[str, dict[str,
 
     if kind == "symbol_calls_symbol":
         score += 150.0
+    elif kind == "internal_import_dependency":
+        score += 130.0
     elif kind == "file_declares_cli_command":
         score += 120.0
     elif kind == "file_imports_module":
@@ -601,12 +664,16 @@ def _edge_relevance_score(edge: dict[str, Any], nodes_by_id: dict[str, dict[str,
         score += 10.0
 
     family_bonus = {
-        "handler_to_analysis": 100.0,
+        "cli_handler_to_analysis": 105.0,
+        "handler_to_analysis": 95.0,
         "analysis_to_report": 90.0,
         "analysis_to_model": 80.0,
-        "scanner_or_io_flow": 70.0,
-        "cli_to_handler": 65.0,
-        "import_dependency": 55.0,
+        "scanner_or_io_flow": 75.0,
+        "cli_support_to_io_or_config": 65.0,
+        "cli_support_to_analysis": 60.0,
+        "cli_entrypoint_to_handler": 60.0,
+        "cli_to_handler": 55.0,
+        "import_dependency": 70.0,
         "report_to_output_writer": 35.0,
         "other_product_flow": 20.0,
         "declaration_context": 0.0,
@@ -614,8 +681,10 @@ def _edge_relevance_score(edge: dict[str, Any], nodes_by_id: dict[str, dict[str,
     }
     score += family_bonus.get(family, 0.0)
 
-    if source_role in {"analysis", "reporting", "cli_surface"}:
+    if source_role in {"analysis", "reporting", "cli_handler", "cli_entrypoint"}:
         score += 35.0
+    if source_role == "cli_support":
+        score += 10.0
     if target_role in {"analysis", "reporting", "model_or_core", "io_or_safety"}:
         score += 35.0
 
@@ -626,6 +695,9 @@ def _edge_relevance_score(edge: dict[str, Any], nodes_by_id: dict[str, dict[str,
         score += 35.0
     if target_label.startswith(("write_", "build_", "collect_", "query_", "render_", "parse_", "scan_", "analyze_")):
         score += 35.0
+
+    if source_role == "cli_support" and family in {"cli_handler_to_analysis", "handler_to_analysis"}:
+        score -= 150.0
 
     return score
 
@@ -715,18 +787,266 @@ def _collapse_representative_edge_candidates(
     )
 
 
-def _representative_edges(nodes: list[dict[str, Any]], edges: list[dict[str, Any]], profile: ProjectProfile, *, limit: int) -> list[dict[str, Any]]:
+def _module_name_from_source_path(path: str, profile: ProjectProfile) -> str:
+    normalized = path.replace("\\", "/")
+    if not normalized.endswith(".py"):
+        return ""
+
+    for prefix in profile.source_prefixes:
+        if normalized.startswith(prefix):
+            relative = normalized[len(prefix):]
+            prefix_parts = _path_parts(prefix.rstrip("/"))
+            package = prefix_parts[-1] if prefix_parts else ""
+            module_parts = list(_path_parts(relative))
+            if not module_parts:
+                return package
+            leaf = module_parts[-1]
+            if leaf == "__init__.py":
+                module_parts = module_parts[:-1]
+            elif leaf.endswith(".py"):
+                module_parts[-1] = leaf[:-3]
+            if package:
+                return ".".join([package, *module_parts])
+            return ".".join(module_parts)
+
+    return ""
+
+
+def _file_node_for_path(path: str, nodes: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for node in nodes:
+        if isinstance(node, dict) and node.get("kind") == "file" and _node_path(node) == path:
+            return node
+    return None
+
+
+def _import_record_source_path(record: dict[str, Any]) -> str:
+    for key in ("path", "file_path", "source_path", "source_file", "file"):
+        value = record.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def _import_record_module(record: dict[str, Any]) -> str:
+    for key in ("module", "imported_module", "target_module", "name", "qualified_name", "module_name"):
+        value = record.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def _import_record_line(record: dict[str, Any]) -> int | None:
+    for key in ("line", "lineno", "line_number", "start_line"):
+        value = record.get(key)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+    return None
+
+
+def _import_record_evidence(record: dict[str, Any], source_path: str) -> str:
+    evidence = record.get("evidence")
+    if isinstance(evidence, str) and evidence:
+        return evidence
+    line = _import_record_line(record)
+    if line is not None:
+        return f"{source_path}:L{line}-L{line}"
+    return source_path
+
+
+def _import_record_resolved_path(record: dict[str, Any]) -> str:
+    for key in ("resolved_path", "resolved_file", "resolved_module_path", "target_path", "target_file", "path_resolved"):
+        value = record.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def _extract_import_records(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    candidates: list[Any] = []
+    for key in ("imports", "records", "import_records", "items"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            candidates.extend(value)
+
+    if not candidates:
+        graph = payload.get("graph")
+        if isinstance(graph, dict):
+            for key in ("imports", "records", "import_records", "items"):
+                value = graph.get(key)
+                if isinstance(value, list):
+                    candidates.extend(value)
+
+    return [item for item in candidates if isinstance(item, dict)]
+
+
+def _read_import_records(layout: OutputLayout) -> list[dict[str, Any]]:
+    payload = _read_json(layout.latest_dir / "import_graph.json")
+    return _extract_import_records(payload)
+
+
+def _module_file_lookup(nodes: list[dict[str, Any]], profile: ProjectProfile) -> dict[str, dict[str, Any]]:
+    lookup: dict[str, dict[str, Any]] = {}
+    for node in nodes:
+        if not isinstance(node, dict) or node.get("kind") != "file":
+            continue
+        path = _node_path(node)
+        if not _is_product_path(path, profile):
+            continue
+        module = _module_name_from_source_path(path, profile)
+        if module:
+            lookup[module] = node
+    return lookup
+
+
+def _resolved_internal_import_payloads(
+    *,
+    layout: OutputLayout,
+    nodes: list[dict[str, Any]],
+    profile: ProjectProfile,
+) -> list[dict[str, Any]]:
+    module_lookup = _module_file_lookup(nodes, profile)
+    file_lookup = {_node_path(node): node for node in nodes if isinstance(node, dict) and node.get("kind") == "file"}
+    records = _read_import_records(layout)
+
+    payloads: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    for record in records:
+        source_path = _import_record_source_path(record)
+        module = _import_record_module(record)
+        resolved_path = _import_record_resolved_path(record)
+
+        if not source_path or not _is_product_path(source_path, profile):
+            continue
+
+        target_node: dict[str, Any] | None = None
+        if resolved_path and _is_product_path(resolved_path, profile):
+            target_node = file_lookup.get(resolved_path) or {"kind": "file", "path": resolved_path, "label": resolved_path}
+        elif module in module_lookup:
+            target_node = module_lookup[module]
+        elif module:
+            # Try longest-prefix resolution for imports of symbols from modules.
+            parts = module.split(".")
+            for end in range(len(parts), 0, -1):
+                candidate = ".".join(parts[:end])
+                if candidate in module_lookup:
+                    target_node = module_lookup[candidate]
+                    break
+
+        if not target_node:
+            continue
+
+        target_path = _node_path(target_node)
+        if not target_path or target_path == source_path or not _is_product_path(target_path, profile):
+            continue
+
+        key = (source_path, module, target_path)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        source_node = file_lookup.get(source_path) or {"kind": "file", "path": source_path, "label": source_path}
+        evidence = _import_record_evidence(record, source_path)
+
+        payloads.append(
+            {
+                "kind": "internal_import_dependency",
+                "source": _display_node(source_node, fallback=source_path),
+                "target": _display_node(target_node, fallback=target_path),
+                "source_path": source_path,
+                "target_path": target_path,
+                "source_role": _path_role(source_path, profile),
+                "target_role": _path_role(target_path, profile),
+                "confidence": record.get("confidence") or "exact_import_statement",
+                "evidence": evidence,
+                "edge_family": "import_dependency",
+                "selection_reason": "shows resolved internal project import dependency",
+                "relevance_score": 505.0,
+                "imported_module": module,
+            }
+        )
+
+    return payloads
+
+
+def _representative_edge_key(payload: dict[str, Any]) -> tuple[str, str, str, str]:
+    return (
+        str(payload.get("kind") or ""),
+        str(payload.get("source") or ""),
+        str(payload.get("target") or ""),
+        str(payload.get("edge_family") or ""),
+    )
+
+
+def _collapse_representative_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+
+    for payload in payloads:
+        key = _representative_edge_key(payload)
+        evidence = str(payload.get("evidence") or "")
+        score = float(payload.get("relevance_score") or 0.0)
+
+        if key not in groups:
+            groups[key] = {
+                "payload": dict(payload),
+                "best_score": score,
+                "evidence_count": 0,
+                "sample_evidence": [],
+            }
+
+        group = groups[key]
+        group["evidence_count"] = int(group["evidence_count"]) + 1
+
+        samples = group["sample_evidence"]
+        if evidence and evidence not in samples:
+            samples.append(evidence)
+
+        if score > float(group["best_score"]):
+            group["payload"] = dict(payload)
+            group["best_score"] = score
+
+    collapsed: list[dict[str, Any]] = []
+    for group in groups.values():
+        payload = dict(group["payload"])
+        samples = list(group["sample_evidence"])[:5]
+        payload["evidence_count"] = int(group["evidence_count"])
+        payload["sample_evidence"] = samples
+        if samples:
+            payload["evidence"] = samples[0]
+        collapsed.append(payload)
+
+    return sorted(
+        collapsed,
+        key=lambda item: (
+            -float(item.get("relevance_score") or 0.0),
+            -int(item.get("evidence_count") or 0),
+            str(item.get("edge_family") or ""),
+            str(item.get("source") or ""),
+            str(item.get("target") or ""),
+        ),
+    )
+
+
+def _representative_edges(
+    nodes: list[dict[str, Any]],
+    edges: list[dict[str, Any]],
+    profile: ProjectProfile,
+    *,
+    limit: int,
+    layout: OutputLayout | None = None,
+) -> list[dict[str, Any]]:
     nodes_by_id = _node_by_id(nodes)
 
     allowed = {
         "symbol_calls_symbol",
         "file_declares_cli_command",
-        "file_imports_module",
         "module_resolves_to_file",
         "file_contains_symbol",
     }
 
-    raw_candidates: list[dict[str, Any]] = []
+    payload_candidates: list[dict[str, Any]] = []
     fallback_external_imports: list[dict[str, Any]] = []
 
     for edge in edges:
@@ -734,6 +1054,17 @@ def _representative_edges(nodes: list[dict[str, Any]], edges: list[dict[str, Any
             continue
 
         kind = str(edge.get("kind") or "")
+        if kind == "file_imports_module":
+            source = _source_node(edge, nodes_by_id)
+            target = _target_node(edge, nodes_by_id)
+            source_path = _node_path(source)
+            target_path = _node_path(target)
+            if _is_product_path(source_path, profile) and target_path and _is_product_path(target_path, profile):
+                payload_candidates.append(_edge_payload(edge, nodes_by_id, profile))
+            elif _is_product_path(source_path, profile):
+                fallback_external_imports.append(_edge_payload(edge, nodes_by_id, profile))
+            continue
+
         if kind not in allowed:
             continue
 
@@ -745,51 +1076,56 @@ def _representative_edges(nodes: list[dict[str, Any]], edges: list[dict[str, Any
         if not (_is_product_path(source_path, profile) or _is_product_path(target_path, profile)):
             continue
 
-        if kind in {"file_imports_module", "module_resolves_to_file"}:
+        if kind in {"module_resolves_to_file"}:
             if not target_path or not _is_product_path(target_path, profile):
-                fallback_external_imports.append(edge)
+                fallback_external_imports.append(_edge_payload(edge, nodes_by_id, profile))
                 continue
 
         if kind == "file_contains_symbol" and not _is_product_path(source_path, profile):
             continue
 
-        raw_candidates.append(edge)
+        payload_candidates.append(_edge_payload(edge, nodes_by_id, profile))
 
-    if not raw_candidates:
-        raw_candidates = fallback_external_imports
+    if layout is not None:
+        payload_candidates.extend(
+            _resolved_internal_import_payloads(
+                layout=layout,
+                nodes=nodes,
+                profile=profile,
+            )
+        )
 
-    ranked_edges = sorted(
-        raw_candidates,
-        key=lambda edge: (
-            -_edge_relevance_score(edge, nodes_by_id, profile),
-            str(edge.get("kind") or ""),
-            _edge_evidence(edge),
-            str(edge.get("source") or ""),
-            str(edge.get("target") or ""),
-        ),
-    )
+    if not payload_candidates:
+        payload_candidates = fallback_external_imports
 
-    ranked = _collapse_representative_edge_candidates(ranked_edges, nodes_by_id, profile)
+    ranked = _collapse_representative_payloads(payload_candidates)
 
     family_caps = {
-        "cli_to_handler": 3,
-        "handler_to_analysis": 4,
+        "cli_entrypoint_to_handler": 2,
+        "cli_handler_to_analysis": 4,
+        "cli_support_to_analysis": 2,
+        "cli_support_to_io_or_config": 2,
+        "handler_to_analysis": 2,
+        "cli_to_handler": 2,
+        "analysis_to_model": 3,
+        "scanner_or_io_flow": 3,
         "analysis_to_report": 3,
         "report_to_output_writer": 2,
         "import_dependency": 3,
         "external_import_dependency": 1,
-        "analysis_to_model": 3,
-        "scanner_or_io_flow": 3,
         "declaration_context": 1,
         "other_product_flow": 3,
     }
 
     coverage_order = [
-        "handler_to_analysis",
+        "cli_handler_to_analysis",
+        "cli_support_to_analysis",
+        "cli_support_to_io_or_config",
         "analysis_to_model",
         "scanner_or_io_flow",
         "analysis_to_report",
         "report_to_output_writer",
+        "cli_entrypoint_to_handler",
         "cli_to_handler",
         "import_dependency",
         "other_product_flow",
@@ -1032,7 +1368,7 @@ def _projection_payload(
     return {
         "schema": {
             "name": "cbl.handoff_projection",
-            "version": 4,
+            "version": 5,
         },
         "issue": issue,
         "scope": "changed" if changed_only else "full",
@@ -1076,7 +1412,7 @@ def _projection_payload(
                 }
                 for node in _entrypoints(nodes, limit=18)
             ],
-            "representative_edges": _representative_edges(nodes, edges, profile, limit=20),
+            "representative_edges": _representative_edges(nodes, edges, profile, limit=20, layout=layout),
             "unresolved_static_calls": unresolved_groups["dynamic_or_dispatch_calls"],
             **unresolved_groups,
         },
