@@ -1,5 +1,15 @@
 from __future__ import annotations
 
+import ast
+import re
+from pathlib import Path
+from textwrap import dedent
+
+ROOT = Path.cwd()
+
+HANDOFF_PROJECTION = r'''
+from __future__ import annotations
+
 import json
 from collections import Counter
 from dataclasses import dataclass
@@ -1200,3 +1210,694 @@ def write_handoff_projection_reports(
         "handoff_projection_json": ".codecontext/latest/handoff_projection.json",
         "handoff_projection_md": ".codecontext/latest/handoff_projection.md",
     }
+'''
+
+AUDIT = r'''
+from __future__ import annotations
+
+import ast
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path.cwd()
+SRC = ROOT / "src"
+
+FORBIDDEN_FAMILIES = {
+    "pack_snapshot_flow",
+    "evidence_graph_flow",
+    "symbol_graph_flow",
+    "graph_query_flow",
+    "cli_orchestration",
+    "reporting_manifest",
+}
+
+
+def fail(message: str) -> None:
+    print(f"FAIL: {message}")
+    raise SystemExit(1)
+
+
+def run_cbl(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(SRC)
+    return subprocess.run(
+        [sys.executable, "-m", "codebase_lens", *args],
+        cwd=cwd or ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def assert_parseable(relative: str) -> None:
+    path = ROOT / relative
+    try:
+        ast.parse(path.read_text(encoding="utf-8"))
+    except SyntaxError as exc:
+        fail(f"{relative} is not parseable: {exc}")
+
+
+def make_synthetic_repo(base: Path) -> Path:
+    repo = base / "acme_repo"
+    package = repo / "src" / "acme_tool"
+    tests = repo / "tests"
+    package.mkdir(parents=True, exist_ok=True)
+    tests.mkdir(parents=True, exist_ok=True)
+
+    (repo / "pyproject.toml").write_text("[project]\nname = 'acme-tool'\n", encoding="utf-8")
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "parser.py").write_text(
+        "\n".join(
+            [
+                "import ast",
+                "",
+                "def parse_file(text: str) -> dict[str, int]:",
+                "    tree = ast.parse(text)",
+                "    return {'nodes': len(list(ast.walk(tree)))}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (package / "reports.py").write_text(
+        "\n".join(
+            [
+                "import json",
+                "",
+                "def write_report(data: dict[str, int]) -> str:",
+                "    return json.dumps(data, sort_keys=True)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (package / "cli.py").write_text(
+        "\n".join(
+            [
+                "import argparse",
+                "from acme_tool.parser import parse_file",
+                "from acme_tool.reports import write_report",
+                "",
+                "def run_analyze(text: str) -> str:",
+                "    data = parse_file(text)",
+                "    return write_report(data)",
+                "",
+                "def build_parser() -> argparse.ArgumentParser:",
+                "    parser = argparse.ArgumentParser()",
+                "    sub = parser.add_subparsers(dest='command')",
+                "    analyze = sub.add_parser('analyze')",
+                "    analyze.set_defaults(handler=run_analyze)",
+                "    return parser",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (tests / "test_parser.py").write_text(
+        "\n".join(
+            [
+                "from acme_tool.parser import parse_file",
+                "",
+                "def test_parse_file():",
+                "    assert parse_file('x = 1')['nodes'] > 0",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return repo
+
+
+def main() -> int:
+    for relative in [
+        "src/codebase_lens/reports/handoff_projection.py",
+        "src/codebase_lens/reports/handoff.py",
+        "src/codebase_lens/cli.py",
+    ]:
+        assert_parseable(relative)
+
+    result = run_cbl("pack", "--issue", "phase 16 projection generality audit", "--budget", "24000", "--no-archive")
+    if result.returncode != 0:
+        fail(f"cbl pack failed on CBL repo:\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}")
+
+    current_payload = json.loads((ROOT / ".codecontext" / "latest" / "handoff_projection.json").read_text(encoding="utf-8"))
+    current_edges = current_payload.get("graph", {}).get("representative_edges", [])
+    if not current_edges:
+        fail("Current repo projection has no representative edges.")
+
+    for edge in current_edges:
+        family = edge.get("edge_family")
+        if family in FORBIDDEN_FAMILIES:
+            fail(f"Current repo projection still uses project-specific family: {family}")
+
+    synthetic_root = ROOT / ".tmp_projection_generality"
+    if synthetic_root.exists():
+        import shutil
+        shutil.rmtree(synthetic_root)
+    synthetic_root.mkdir(parents=True, exist_ok=True)
+
+    repo = make_synthetic_repo(synthetic_root)
+    synthetic = run_cbl("pack", "--repo", str(repo), "--issue", "synthetic generic repo", "--budget", "24000", "--no-archive")
+    if synthetic.returncode != 0:
+        fail(f"cbl pack failed on synthetic repo:\nSTDOUT:\n{synthetic.stdout}\nSTDERR:\n{synthetic.stderr}")
+
+    latest = repo / ".codecontext" / "latest"
+    projection = (latest / "handoff_projection.md").read_text(encoding="utf-8")
+    payload = json.loads((latest / "handoff_projection.json").read_text(encoding="utf-8"))
+
+    if "src/acme_tool/" not in projection:
+        fail("Synthetic projection did not surface synthetic product source paths.")
+    if "codebase_lens" in projection:
+        fail("Synthetic projection leaked CBL package names into projection content.")
+
+    prefixes = payload.get("project_profile", {}).get("source_prefixes", [])
+    if "src/acme_tool/" not in prefixes:
+        fail(f"Synthetic projection did not infer source prefix src/acme_tool/: {prefixes}")
+
+    families = {
+        edge.get("edge_family")
+        for edge in payload.get("graph", {}).get("representative_edges", [])
+    }
+    if not families:
+        fail("Synthetic projection has no representative edge families.")
+    if families & FORBIDDEN_FAMILIES:
+        fail(f"Synthetic projection contains forbidden project-specific families: {sorted(families & FORBIDDEN_FAMILIES)}")
+
+    expected_generic = {
+        "handler_to_analysis",
+        "analysis_to_report",
+        "cli_to_handler",
+        "import_dependency",
+        "other_product_flow",
+    }
+    if not (families & expected_generic):
+        fail(f"Synthetic projection does not contain generic edge families: {sorted(families)}")
+
+    print("PASS: Phase 16 projection generality audit passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
+SEMANTICS_AUDIT = r'''
+from __future__ import annotations
+
+import ast
+import json
+import os
+import subprocess
+import sys
+from collections import Counter
+from pathlib import Path
+
+ROOT = Path.cwd()
+SRC = ROOT / "src"
+
+
+def fail(message: str) -> None:
+    print(f"FAIL: {message}")
+    raise SystemExit(1)
+
+
+def run_cbl(*args: str) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(SRC)
+    return subprocess.run(
+        [sys.executable, "-m", "codebase_lens", *args],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def assert_parseable(relative: str) -> None:
+    path = ROOT / relative
+    try:
+        ast.parse(path.read_text(encoding="utf-8"))
+    except SyntaxError as exc:
+        fail(f"{relative} is not parseable: {exc}")
+
+
+def section(text: str, heading: str) -> str:
+    marker = f"## {heading}"
+    start = text.find(marker)
+    if start == -1:
+        fail(f"Missing section: {heading}")
+    next_start = text.find("\n## ", start + len(marker))
+    if next_start == -1:
+        return text[start:]
+    return text[start:next_start]
+
+
+def main() -> int:
+    for relative in [
+        "src/codebase_lens/reports/handoff_projection.py",
+        "src/codebase_lens/reports/handoff.py",
+        "src/codebase_lens/cli.py",
+    ]:
+        assert_parseable(relative)
+
+    result = run_cbl("pack", "--issue", "phase 15 projection semantics audit", "--budget", "24000", "--no-archive")
+    if result.returncode != 0:
+        fail(f"cbl pack failed:\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}")
+
+    latest = ROOT / ".codecontext" / "latest"
+    projection_path = latest / "handoff_projection.md"
+    projection_json_path = latest / "handoff_projection.json"
+
+    if not projection_path.is_file():
+        fail("handoff_projection.md was not generated.")
+    if not projection_json_path.is_file():
+        fail("handoff_projection.json was not generated.")
+
+    text = projection_path.read_text(encoding="utf-8")
+    payload = json.loads(projection_json_path.read_text(encoding="utf-8"))
+
+    representative = section(text, "Representative Dependency Edges")
+    unresolved = section(text, "Dynamic / Unresolved Calls")
+
+    if "src/codebase_lens/" not in representative:
+        fail("Representative edges do not surface current product code.")
+    if "::" not in representative:
+        fail("Representative edges do not path-qualify symbol display.")
+    if "scripts/dev/audits/" in representative:
+        fail("Representative edges are polluted by audit helper files.")
+    if "`fail`" in representative or "`run_cbl`" in representative or "`names_in_file`" in representative:
+        fail("Representative edges include low-value audit helper symbols.")
+    if "Family:" not in representative or "reason:" not in representative or "score:" not in representative:
+        fail("Representative edges do not expose selection metadata.")
+
+    forbidden_families = {
+        "pack_snapshot_flow",
+        "evidence_graph_flow",
+        "symbol_graph_flow",
+        "graph_query_flow",
+        "cli_orchestration",
+        "reporting_manifest",
+    }
+    for family in forbidden_families:
+        if family in representative:
+            fail(f"Representative edges still use project-specific family: {family}")
+
+    if "scripts/dev/audits/" in unresolved:
+        fail("Unresolved calls are polluted by audit helper files.")
+    if "`print`" in unresolved or "`SystemExit`" in unresolved:
+        fail("Unresolved calls include low-value builtins/audit exits.")
+
+    graph = payload.get("graph", {})
+    edges = graph.get("representative_edges", [])
+    if not isinstance(edges, list) or not edges:
+        fail("handoff_projection.json has no representative edges.")
+
+    required_edge_fields = {"edge_family", "selection_reason", "relevance_score", "source_path", "target_path", "source_role", "target_role"}
+    for edge in edges[:10]:
+        missing = required_edge_fields - set(edge)
+        if missing:
+            fail(f"Representative edge missing fields: {sorted(missing)}")
+        blob = json.dumps(edge, sort_keys=True)
+        if "scripts/dev/audits/" in blob:
+            fail("handoff_projection.json representative edges include audit paths.")
+        if edge.get("edge_family") in forbidden_families:
+            fail(f"JSON representative edge uses project-specific family: {edge.get('edge_family')}")
+
+    family_counts = Counter(str(edge.get("edge_family")) for edge in edges)
+    if family_counts["cli_to_handler"] > 4:
+        fail("Representative edges overuse cli_to_handler family.")
+    if family_counts["report_to_output_writer"] > 4:
+        fail("Representative edges overuse report_to_output_writer family.")
+
+    if "dynamic_or_dispatch_calls" not in graph:
+        fail("Projection JSON missing dynamic_or_dispatch_calls.")
+    if "external_library_calls" not in graph:
+        fail("Projection JSON missing external_library_calls.")
+    if "attribute_or_external_calls" not in graph:
+        fail("Projection JSON missing attribute_or_external_calls.")
+    if "omitted_low_value_unresolved_call_count" not in graph:
+        fail("Projection JSON missing omitted low-value unresolved call count.")
+
+    if "External/library calls summarized" not in unresolved and graph.get("external_library_calls"):
+        fail("Markdown does not summarize external/library calls.")
+
+    if graph.get("omitted_low_value_unresolved_call_count", 0) < 1:
+        fail("Projection did not count omitted low-value unresolved calls.")
+
+    if "project_profile" not in payload:
+        fail("Projection JSON missing generic project_profile.")
+
+    print("PASS: Phase 15 projection semantics audit passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
+SEMANTICS_TEST = r'''
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from collections import Counter
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+
+
+def run_cbl(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(SRC)
+    return subprocess.run(
+        [sys.executable, "-m", "codebase_lens", *args],
+        cwd=cwd or ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def test_handoff_projection_adds_semantic_edge_metadata_and_filters_low_value_calls() -> None:
+    result = run_cbl("pack", "--issue", "projection semantics test", "--budget", "24000", "--no-archive")
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    latest = ROOT / ".codecontext" / "latest"
+    text = (latest / "handoff_projection.md").read_text(encoding="utf-8")
+    payload = json.loads((latest / "handoff_projection.json").read_text(encoding="utf-8"))
+
+    representative_start = text.index("## Representative Dependency Edges")
+    unresolved_start = text.index("## Dynamic / Unresolved Calls")
+    changed_start = text.index("## Changed Scope")
+
+    representative = text[representative_start:unresolved_start]
+    unresolved = text[unresolved_start:changed_start]
+
+    assert "src/codebase_lens/" in representative
+    assert "::" in representative
+    assert "Family:" in representative
+    assert "reason:" in representative
+    assert "score:" in representative
+    assert "scripts/dev/audits/" not in representative
+    assert "`fail`" not in representative
+    assert "`run_cbl`" not in representative
+
+    forbidden_families = {
+        "pack_snapshot_flow",
+        "evidence_graph_flow",
+        "symbol_graph_flow",
+        "graph_query_flow",
+        "cli_orchestration",
+        "reporting_manifest",
+    }
+    for family in forbidden_families:
+        assert family not in representative
+
+    assert "scripts/dev/audits/" not in unresolved
+    assert "`print`" not in unresolved
+    assert "`SystemExit`" not in unresolved
+
+    graph = payload["graph"]
+    edges = graph["representative_edges"]
+    assert edges
+
+    for edge in edges:
+        assert "edge_family" in edge
+        assert "selection_reason" in edge
+        assert "relevance_score" in edge
+        assert "source_path" in edge
+        assert "target_path" in edge
+        assert "source_role" in edge
+        assert "target_role" in edge
+        assert edge["edge_family"] not in forbidden_families
+
+    families = Counter(edge["edge_family"] for edge in edges)
+    assert families["cli_to_handler"] <= 4
+    assert families["report_to_output_writer"] <= 4
+    assert {
+        "handler_to_analysis",
+        "analysis_to_report",
+        "import_dependency",
+        "scanner_or_io_flow",
+        "analysis_to_model",
+        "other_product_flow",
+    } & set(families)
+
+    assert "project_profile" in payload
+    assert payload["project_profile"]["source_prefixes"]
+
+    assert "dynamic_or_dispatch_calls" in graph
+    assert "external_library_calls" in graph
+    assert "attribute_or_external_calls" in graph
+    assert "omitted_low_value_unresolved_call_count" in graph
+    assert graph["omitted_low_value_unresolved_call_count"] >= 1
+
+    for item in graph["dynamic_or_dispatch_calls"]:
+        blob = json.dumps(item, sort_keys=True)
+        assert "scripts/dev/audits/" not in blob
+        assert "SystemExit" not in blob
+        assert "print" not in blob
+'''
+
+GENERALITY_TEST = r'''
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+
+FORBIDDEN_FAMILIES = {
+    "pack_snapshot_flow",
+    "evidence_graph_flow",
+    "symbol_graph_flow",
+    "graph_query_flow",
+    "cli_orchestration",
+    "reporting_manifest",
+}
+
+
+def run_cbl(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(SRC)
+    return subprocess.run(
+        [sys.executable, "-m", "codebase_lens", *args],
+        cwd=cwd or ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def make_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "acme_repo"
+    package = repo / "src" / "acme_tool"
+    tests = repo / "tests"
+    package.mkdir(parents=True)
+    tests.mkdir(parents=True)
+
+    (repo / "pyproject.toml").write_text("[project]\nname = 'acme-tool'\n", encoding="utf-8")
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "parser.py").write_text(
+        "\n".join(
+            [
+                "import ast",
+                "",
+                "def parse_file(text: str) -> dict[str, int]:",
+                "    tree = ast.parse(text)",
+                "    return {'nodes': len(list(ast.walk(tree)))}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (package / "reports.py").write_text(
+        "\n".join(
+            [
+                "import json",
+                "",
+                "def write_report(data: dict[str, int]) -> str:",
+                "    return json.dumps(data, sort_keys=True)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (package / "cli.py").write_text(
+        "\n".join(
+            [
+                "import argparse",
+                "from acme_tool.parser import parse_file",
+                "from acme_tool.reports import write_report",
+                "",
+                "def run_analyze(text: str) -> str:",
+                "    data = parse_file(text)",
+                "    return write_report(data)",
+                "",
+                "def build_parser() -> argparse.ArgumentParser:",
+                "    parser = argparse.ArgumentParser()",
+                "    sub = parser.add_subparsers(dest='command')",
+                "    analyze = sub.add_parser('analyze')",
+                "    analyze.set_defaults(handler=run_analyze)",
+                "    return parser",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (tests / "test_parser.py").write_text(
+        "\n".join(
+            [
+                "from acme_tool.parser import parse_file",
+                "",
+                "def test_parse_file():",
+                "    assert parse_file('x = 1')['nodes'] > 0",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    return repo
+
+
+def test_projection_uses_generic_heuristics_on_synthetic_non_cbl_repo(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+
+    result = run_cbl("pack", "--repo", str(repo), "--issue", "synthetic generic repo", "--budget", "24000", "--no-archive")
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    latest = repo / ".codecontext" / "latest"
+    projection = (latest / "handoff_projection.md").read_text(encoding="utf-8")
+    payload = json.loads((latest / "handoff_projection.json").read_text(encoding="utf-8"))
+
+    assert "src/acme_tool/" in projection
+    assert "codebase_lens" not in projection
+    assert "src/acme_tool/" in payload["project_profile"]["source_prefixes"]
+
+    families = {edge["edge_family"] for edge in payload["graph"]["representative_edges"]}
+    assert families
+    assert not (families & FORBIDDEN_FAMILIES)
+    assert families & {
+        "handler_to_analysis",
+        "analysis_to_report",
+        "cli_to_handler",
+        "import_dependency",
+        "other_product_flow",
+    }
+
+    edge_blob = json.dumps(payload["graph"]["representative_edges"], sort_keys=True)
+    assert "src/acme_tool/" in edge_blob
+    assert "codebase_lens" not in edge_blob
+'''
+
+def normalize(content: str) -> str:
+    return dedent(content).strip("\n") + "\n"
+
+
+def write_file(relative: str, content: str, modified: set[Path]) -> None:
+    path = ROOT / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(normalize(content), encoding="utf-8", newline="\n")
+    if path.suffix == ".py":
+        modified.add(path)
+
+
+def list_bounds_for_key(text: str, key: str) -> tuple[int, int]:
+    match = re.search(rf'(?P<quote>["\']){re.escape(key)}(?P=quote)\s*:\s*\[', text)
+    if not match:
+        raise RuntimeError(f"Could not find list key {key!r}.")
+
+    open_index = text.find("[", match.start())
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    i = open_index
+
+    while i < len(text):
+        ch = text[i]
+
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == quote:
+                quote = None
+            i += 1
+            continue
+
+        if ch in {"'", '"'}:
+            quote = ch
+        elif ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                return open_index, i
+
+        i += 1
+
+    raise RuntimeError(f"Could not find closing bracket for {key!r}.")
+
+
+def insert_before_list_close(text: str, key: str, block: str) -> str:
+    _, close = list_bounds_for_key(text, key)
+    return text[:close] + block + text[close:]
+
+
+def patch_contract(modified: set[Path]) -> None:
+    path = ROOT / "src" / "codebase_lens" / "contracts" / "architecture.py"
+    text = path.read_text(encoding="utf-8")
+
+    required_file = "scripts/dev/audits/audit_phase16_projection_generality.py"
+    if f'"{required_file}"' not in text and f"'{required_file}'" not in text:
+        text = insert_before_list_close(text, "required_files", f'            "{required_file}",\n')
+
+    path.write_text(text, encoding="utf-8", newline="\n")
+    modified.add(path)
+
+
+def assert_parseable(paths: set[Path]) -> None:
+    for path in sorted(paths):
+        if path.suffix != ".py":
+            continue
+        try:
+            ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError as exc:
+            raise RuntimeError(f"Generated invalid Python in {path}: {exc}") from exc
+
+
+def main() -> int:
+    modified: set[Path] = set()
+
+    write_file("src/codebase_lens/reports/handoff_projection.py", HANDOFF_PROJECTION, modified)
+    write_file("scripts/dev/audits/audit_phase16_projection_generality.py", AUDIT, modified)
+    write_file("scripts/dev/audits/audit_phase15_projection_semantics.py", SEMANTICS_AUDIT, modified)
+    write_file("tests/test_handoff_projection_semantics.py", SEMANTICS_TEST, modified)
+    write_file("tests/test_handoff_projection_generality.py", GENERALITY_TEST, modified)
+    patch_contract(modified)
+
+    assert_parseable(modified)
+
+    print("Slice 015D applied: projection heuristics generalized beyond the CBL codebase.")
+    print("The updater parsed every modified Python file before exiting.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

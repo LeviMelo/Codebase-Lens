@@ -48,6 +48,17 @@ def test_handoff_projection_adds_semantic_edge_metadata_and_filters_low_value_ca
     assert "`fail`" not in representative
     assert "`run_cbl`" not in representative
 
+    forbidden_families = {
+        "pack_snapshot_flow",
+        "evidence_graph_flow",
+        "symbol_graph_flow",
+        "graph_query_flow",
+        "cli_orchestration",
+        "reporting_manifest",
+    }
+    for family in forbidden_families:
+        assert family not in representative
+
     assert "scripts/dev/audits/" not in unresolved
     assert "`print`" not in unresolved
     assert "`SystemExit`" not in unresolved
@@ -62,11 +73,24 @@ def test_handoff_projection_adds_semantic_edge_metadata_and_filters_low_value_ca
         assert "relevance_score" in edge
         assert "source_path" in edge
         assert "target_path" in edge
+        assert "source_role" in edge
+        assert "target_role" in edge
+        assert edge["edge_family"] not in forbidden_families
 
     families = Counter(edge["edge_family"] for edge in edges)
-    assert families["cli_orchestration"] <= 4
-    assert families["reporting_manifest"] <= 4
-    assert {"pack_snapshot_flow", "evidence_graph_flow", "symbol_graph_flow", "graph_query_flow"} & set(families)
+    assert families["cli_to_handler"] <= 4
+    assert families["report_to_output_writer"] <= 4
+    assert {
+        "handler_to_analysis",
+        "analysis_to_report",
+        "import_dependency",
+        "scanner_or_io_flow",
+        "analysis_to_model",
+        "other_product_flow",
+    } & set(families)
+
+    assert "project_profile" in payload
+    assert payload["project_profile"]["source_prefixes"]
 
     assert "dynamic_or_dispatch_calls" in graph
     assert "external_library_calls" in graph

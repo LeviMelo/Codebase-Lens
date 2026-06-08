@@ -77,7 +77,7 @@ def main() -> int:
     unresolved = section(text, "Dynamic / Unresolved Calls")
 
     if "src/codebase_lens/" not in representative:
-        fail("Representative edges do not surface product code.")
+        fail("Representative edges do not surface current product code.")
     if "::" not in representative:
         fail("Representative edges do not path-qualify symbol display.")
     if "scripts/dev/audits/" in representative:
@@ -86,6 +86,18 @@ def main() -> int:
         fail("Representative edges include low-value audit helper symbols.")
     if "Family:" not in representative or "reason:" not in representative or "score:" not in representative:
         fail("Representative edges do not expose selection metadata.")
+
+    forbidden_families = {
+        "pack_snapshot_flow",
+        "evidence_graph_flow",
+        "symbol_graph_flow",
+        "graph_query_flow",
+        "cli_orchestration",
+        "reporting_manifest",
+    }
+    for family in forbidden_families:
+        if family in representative:
+            fail(f"Representative edges still use project-specific family: {family}")
 
     if "scripts/dev/audits/" in unresolved:
         fail("Unresolved calls are polluted by audit helper files.")
@@ -97,7 +109,7 @@ def main() -> int:
     if not isinstance(edges, list) or not edges:
         fail("handoff_projection.json has no representative edges.")
 
-    required_edge_fields = {"edge_family", "selection_reason", "relevance_score", "source_path", "target_path"}
+    required_edge_fields = {"edge_family", "selection_reason", "relevance_score", "source_path", "target_path", "source_role", "target_role"}
     for edge in edges[:10]:
         missing = required_edge_fields - set(edge)
         if missing:
@@ -105,12 +117,14 @@ def main() -> int:
         blob = json.dumps(edge, sort_keys=True)
         if "scripts/dev/audits/" in blob:
             fail("handoff_projection.json representative edges include audit paths.")
+        if edge.get("edge_family") in forbidden_families:
+            fail(f"JSON representative edge uses project-specific family: {edge.get('edge_family')}")
 
     family_counts = Counter(str(edge.get("edge_family")) for edge in edges)
-    if family_counts["cli_orchestration"] > 4:
-        fail("Representative edges overuse cli_orchestration family.")
-    if family_counts["reporting_manifest"] > 4:
-        fail("Representative edges overuse reporting_manifest family.")
+    if family_counts["cli_to_handler"] > 4:
+        fail("Representative edges overuse cli_to_handler family.")
+    if family_counts["report_to_output_writer"] > 4:
+        fail("Representative edges overuse report_to_output_writer family.")
 
     if "dynamic_or_dispatch_calls" not in graph:
         fail("Projection JSON missing dynamic_or_dispatch_calls.")
@@ -126,6 +140,9 @@ def main() -> int:
 
     if graph.get("omitted_low_value_unresolved_call_count", 0) < 1:
         fail("Projection did not count omitted low-value unresolved calls.")
+
+    if "project_profile" not in payload:
+        fail("Projection JSON missing generic project_profile.")
 
     print("PASS: Phase 15 projection semantics audit passed.")
     return 0
