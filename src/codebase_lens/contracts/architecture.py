@@ -85,6 +85,8 @@ def builtin_cbl_contract() -> dict[str, Any]:
             "scripts/dev/audits/audit_phase17_projection_noise.py",
             "scripts/dev/audits/audit_phase18_projection_dedup.py",
             "scripts/dev/audits/audit_phase19_projection_roles_imports.py",
+            "src/codebase_lens/contracts/command_surface.py",
+            "scripts/dev/audits/audit_phase20_public_command_stability.py",
 ],
         "required_symbols": [
             {

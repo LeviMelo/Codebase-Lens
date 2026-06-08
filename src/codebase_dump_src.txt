@@ -19,6 +19,7 @@ Project structure for '/c/Users/Galaxy/LEVI/projects/CBL/src':
   codebase_lens/contracts/__init__.py
   codebase_lens/contracts/architecture.py
   codebase_lens/contracts/builtin_templates.py
+  codebase_lens/contracts/command_surface.py
   codebase_lens/contracts/schema.py
   codebase_lens/core/__init__.py
   codebase_lens/core/budget.py
@@ -58,6 +59,498 @@ Project structure for '/c/Users/Galaxy/LEVI/projects/CBL/src':
   codebase_lens/scanners/text.py
   codebase_lens/scanners/tree.py
   codebase_lens/scanners/universe.py
+
+
+
+###############################################################################
+### FILE: codebase_lens/contracts/command_surface.py
+###############################################################################
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any
+
+
+@dataclass(frozen=True)
+class CommandSurfaceIssue:
+    severity: str
+    code: str
+    message: str
+    details: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class CommandSurfaceAuditResult:
+    ok: bool
+    public_commands: tuple[str, ...]
+    parser_subcommands: tuple[str, ...]
+    issues: tuple[CommandSurfaceIssue, ...]
+    external_repo: dict[str, Any]
+
+
+# These are mandatory artifacts for `cbl pack`.
+# Do not include command-specific artifacts such as `tree.md`, which belongs to
+# the tree-report command surface rather than the handoff pack contract.
+CORE_EXTERNAL_PACK_ARTIFACTS = (
+    "manifest.json",
+    "handoff_projection.json",
+    "handoff_projection.md",
+    "ai_handoff.md",
+    "evidence_graph.json",
+    "graph_summary.md",
+    "symbol_graph.json",
+    "symbol_graph.md",
+    "file_inventory.json",
+)
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[3]
+
+
+def _src_root() -> Path:
+    return _repo_root() / "src"
+
+
+def _python_env() -> dict[str, str]:
+    env = os.environ.copy()
+    current = env.get("PYTHONPATH", "")
+    src = str(_src_root())
+    env["PYTHONPATH"] = src if not current else src + os.pathsep + current
+    return env
+
+
+def _run_python_module(
+    args: list[str],
+    *,
+    cwd: Path,
+    timeout: int = 30,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-m", "codebase_lens", *args],
+        cwd=cwd,
+        env=_python_env(),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=timeout,
+    )
+
+
+def _load_cli_objects() -> tuple[Any, Any]:
+    from codebase_lens import cli
+
+    public_commands = getattr(cli, "PUBLIC_COMMANDS", None)
+    build_parser = getattr(cli, "build_parser", None)
+    if public_commands is None:
+        raise RuntimeError("codebase_lens.cli.PUBLIC_COMMANDS is missing.")
+    if build_parser is None:
+        raise RuntimeError("codebase_lens.cli.build_parser is missing.")
+    return public_commands, build_parser
+
+
+def _parser_subcommands(parser: argparse.ArgumentParser) -> tuple[str, ...]:
+    commands: set[str] = set()
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            commands.update(str(name) for name in action.choices)
+    return tuple(sorted(commands))
+
+
+def inspect_public_command_surface() -> tuple[tuple[str, ...], tuple[str, ...], tuple[CommandSurfaceIssue, ...]]:
+    issues: list[CommandSurfaceIssue] = []
+
+    try:
+        public_commands_obj, build_parser = _load_cli_objects()
+    except Exception as exc:  # pragma: no cover - exercised by audit subprocess on failure
+        return (), (), (
+            CommandSurfaceIssue(
+                severity="error",
+                code="cli_import_failed",
+                message="Could not import CLI public command surface.",
+                details={"exception": repr(exc)},
+            ),
+        )
+
+    public_commands = tuple(sorted(str(command) for command in public_commands_obj))
+
+    try:
+        parser = build_parser()
+    except Exception as exc:
+        return public_commands, (), (
+            CommandSurfaceIssue(
+                severity="error",
+                code="build_parser_failed",
+                message="build_parser() raised an exception.",
+                details={"exception": repr(exc)},
+            ),
+        )
+
+    parser_commands = _parser_subcommands(parser)
+
+    missing_from_parser = sorted(set(public_commands) - set(parser_commands))
+    missing_from_public = sorted(set(parser_commands) - set(public_commands))
+
+    if missing_from_parser:
+        issues.append(
+            CommandSurfaceIssue(
+                severity="error",
+                code="public_command_missing_from_parser",
+                message="PUBLIC_COMMANDS contains commands that are not registered in argparse.",
+                details={"commands": missing_from_parser},
+            )
+        )
+
+    if missing_from_public:
+        issues.append(
+            CommandSurfaceIssue(
+                severity="error",
+                code="parser_command_missing_from_public_commands",
+                message="Argparse registers commands that are absent from PUBLIC_COMMANDS.",
+                details={"commands": missing_from_public},
+            )
+        )
+
+    if not public_commands:
+        issues.append(
+            CommandSurfaceIssue(
+                severity="error",
+                code="empty_public_commands",
+                message="PUBLIC_COMMANDS is empty.",
+            )
+        )
+
+    return public_commands, parser_commands, tuple(issues)
+
+
+def run_help_smoke_checks(public_commands: tuple[str, ...]) -> tuple[CommandSurfaceIssue, ...]:
+    issues: list[CommandSurfaceIssue] = []
+    root = _repo_root()
+
+    top = _run_python_module(["--help"], cwd=root, timeout=20)
+    if top.returncode != 0:
+        issues.append(
+            CommandSurfaceIssue(
+                severity="error",
+                code="top_level_help_failed",
+                message="Top-level CLI --help failed.",
+                details={"returncode": top.returncode, "stdout": top.stdout[-1000:], "stderr": top.stderr[-1000:]},
+            )
+        )
+    elif "usage:" not in top.stdout.lower():
+        issues.append(
+            CommandSurfaceIssue(
+                severity="error",
+                code="top_level_help_missing_usage",
+                message="Top-level CLI --help did not emit usage text.",
+                details={"stdout": top.stdout[:1000]},
+            )
+        )
+
+    for command in public_commands:
+        result = _run_python_module([command, "--help"], cwd=root, timeout=20)
+        if result.returncode != 0:
+            issues.append(
+                CommandSurfaceIssue(
+                    severity="error",
+                    code="subcommand_help_failed",
+                    message=f"Subcommand help failed for {command!r}.",
+                    details={
+                        "command": command,
+                        "returncode": result.returncode,
+                        "stdout": result.stdout[-1000:],
+                        "stderr": result.stderr[-1000:],
+                    },
+                )
+            )
+            continue
+
+        output = result.stdout.lower()
+        if "usage:" not in output:
+            issues.append(
+                CommandSurfaceIssue(
+                    severity="error",
+                    code="subcommand_help_missing_usage",
+                    message=f"Subcommand help for {command!r} did not emit usage text.",
+                    details={"command": command, "stdout": result.stdout[:1000]},
+                )
+            )
+
+    return tuple(issues)
+
+
+def _write_synthetic_external_repo(base: Path) -> Path:
+    repo = base / "external_target_repo"
+    package = repo / "src" / "demo_pkg"
+    tests = repo / "tests"
+    package.mkdir(parents=True, exist_ok=True)
+    tests.mkdir(parents=True, exist_ok=True)
+
+    (repo / "pyproject.toml").write_text(
+        "\n".join(
+            [
+                "[project]",
+                "name = 'demo-pkg'",
+                "version = '0.0.0'",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    # This must never execute. CBL should parse target code statically, not import it.
+    (package / "__init__.py").write_text(
+        "raise RuntimeError('CBL imported the target repository package')\n",
+        encoding="utf-8",
+    )
+
+    (package / "core.py").write_text(
+        "\n".join(
+            [
+                "from __future__ import annotations",
+                "",
+                "class Thing:",
+                "    def __init__(self, name: str) -> None:",
+                "        self.name = name",
+                "",
+                "def normalize_name(name: str) -> str:",
+                "    return name.strip().lower()",
+                "",
+                "def build_thing(name: str) -> Thing:",
+                "    return Thing(normalize_name(name))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    (package / "cli.py").write_text(
+        "\n".join(
+            [
+                "from __future__ import annotations",
+                "",
+                "import argparse",
+                "from demo_pkg.core import build_thing",
+                "",
+                "def _run_build(raw: str) -> str:",
+                "    thing = build_thing(raw)",
+                "    return thing.name",
+                "",
+                "def build_parser() -> argparse.ArgumentParser:",
+                "    parser = argparse.ArgumentParser()",
+                "    sub = parser.add_subparsers(dest='command')",
+                "    build = sub.add_parser('build')",
+                "    build.set_defaults(handler=_run_build)",
+                "    return parser",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    (tests / "test_core.py").write_text(
+        "\n".join(
+            [
+                "from demo_pkg.core import normalize_name",
+                "",
+                "def test_normalize_name():",
+                "    assert normalize_name('  A  ') == 'a'",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    return repo
+
+
+def _graph_node_paths(evidence_graph_path: Path) -> list[str]:
+    if not evidence_graph_path.is_file():
+        return []
+
+    payload = json.loads(evidence_graph_path.read_text(encoding="utf-8"))
+    nodes = payload.get("nodes", [])
+    paths: list[str] = []
+    if isinstance(nodes, list):
+        for node in nodes:
+            if isinstance(node, dict) and isinstance(node.get("path"), str):
+                paths.append(node["path"])
+    return paths
+
+
+def run_external_repo_pack_check() -> tuple[dict[str, Any], tuple[CommandSurfaceIssue, ...]]:
+    issues: list[CommandSurfaceIssue] = []
+
+    with tempfile.TemporaryDirectory(prefix="cbl_command_surface_") as temp_dir:
+        workspace = Path(temp_dir)
+        target_repo = _write_synthetic_external_repo(workspace)
+        runner_cwd = workspace / "runner"
+        runner_cwd.mkdir(parents=True, exist_ok=True)
+
+        result = _run_python_module(
+            [
+                "pack",
+                "--repo",
+                str(target_repo),
+                "--issue",
+                "external repo command surface audit",
+                "--budget",
+                "12000",
+                "--no-archive",
+            ],
+            cwd=runner_cwd,
+            timeout=45,
+        )
+
+        latest = target_repo / ".codecontext" / "latest"
+        manifest_path = latest / "manifest.json"
+        projection_path = latest / "handoff_projection.json"
+        evidence_graph_path = latest / "evidence_graph.json"
+
+        external_report: dict[str, Any] = {
+            "target_repo": str(target_repo),
+            "runner_cwd": str(runner_cwd),
+            "returncode": result.returncode,
+            "latest_dir_exists": latest.is_dir(),
+            "manifest_exists": manifest_path.is_file(),
+            "projection_exists": projection_path.is_file(),
+            "evidence_graph_exists": evidence_graph_path.is_file(),
+            "missing_core_artifacts": [],
+            "scanned_codecontext_paths": [],
+            "projection_source_prefixes": [],
+            "stdout_tail": result.stdout[-1000:],
+            "stderr_tail": result.stderr[-1000:],
+        }
+
+        if result.returncode != 0:
+            issues.append(
+                CommandSurfaceIssue(
+                    severity="error",
+                    code="external_repo_pack_failed",
+                    message="cbl pack --repo failed from outside the target repository.",
+                    details=external_report,
+                )
+            )
+            return external_report, tuple(issues)
+
+        missing = [
+            artifact
+            for artifact in CORE_EXTERNAL_PACK_ARTIFACTS
+            if not (latest / artifact).is_file()
+        ]
+        external_report["missing_core_artifacts"] = missing
+        if missing:
+            issues.append(
+                CommandSurfaceIssue(
+                    severity="error",
+                    code="external_repo_pack_missing_artifacts",
+                    message="External repo pack did not write all core latest/ artifacts.",
+                    details={"missing": missing},
+                )
+            )
+
+        scanned_codecontext = [
+            path
+            for path in _graph_node_paths(evidence_graph_path)
+            if path.startswith(".codecontext/") or "/.codecontext/" in path or "\\.codecontext\\" in path
+        ]
+        external_report["scanned_codecontext_paths"] = scanned_codecontext
+        if scanned_codecontext:
+            issues.append(
+                CommandSurfaceIssue(
+                    severity="error",
+                    code="codecontext_recursively_scanned",
+                    message=".codecontext was scanned as target source in the external repo pack.",
+                    details={"paths": scanned_codecontext[:20]},
+                )
+            )
+
+        if projection_path.is_file():
+            projection = json.loads(projection_path.read_text(encoding="utf-8"))
+            prefixes = projection.get("project_profile", {}).get("source_prefixes", [])
+            external_report["projection_source_prefixes"] = prefixes
+            if "src/demo_pkg/" not in prefixes:
+                issues.append(
+                    CommandSurfaceIssue(
+                        severity="error",
+                        code="external_repo_source_prefix_not_inferred",
+                        message="External repo projection did not infer the synthetic package source prefix.",
+                        details={"source_prefixes": prefixes},
+                    )
+                )
+
+            projection_blob = json.dumps(projection, sort_keys=True)
+            if "CBL imported the target repository package" in projection_blob:
+                issues.append(
+                    CommandSurfaceIssue(
+                        severity="error",
+                        code="target_repo_import_side_effect_seen",
+                        message="Projection contains the target import side-effect marker.",
+                    )
+                )
+
+    return external_report, tuple(issues)
+
+
+def audit_command_surface(*, include_help: bool = True, include_external_pack: bool = True) -> CommandSurfaceAuditResult:
+    public_commands, parser_commands, parity_issues = inspect_public_command_surface()
+    issues: list[CommandSurfaceIssue] = list(parity_issues)
+    external_repo: dict[str, Any] = {}
+
+    if include_help:
+        issues.extend(run_help_smoke_checks(public_commands))
+
+    if include_external_pack:
+        external_repo, external_issues = run_external_repo_pack_check()
+        issues.extend(external_issues)
+
+    ok = not any(issue.severity == "error" for issue in issues)
+
+    return CommandSurfaceAuditResult(
+        ok=ok,
+        public_commands=public_commands,
+        parser_subcommands=parser_commands,
+        issues=tuple(issues),
+        external_repo=external_repo,
+    )
+
+
+def command_surface_result_payload(result: CommandSurfaceAuditResult) -> dict[str, Any]:
+    return {
+        "schema": {
+            "name": "cbl.command_surface_audit",
+            "version": 1,
+        },
+        "ok": result.ok,
+        "public_commands": list(result.public_commands),
+        "parser_subcommands": list(result.parser_subcommands),
+        "counts": {
+            "public_commands": len(result.public_commands),
+            "parser_subcommands": len(result.parser_subcommands),
+            "issues": len(result.issues),
+            "errors": sum(1 for issue in result.issues if issue.severity == "error"),
+            "warnings": sum(1 for issue in result.issues if issue.severity == "warning"),
+        },
+        "issues": [asdict(issue) for issue in result.issues],
+        "external_repo": result.external_repo,
+    }
+
+
+def write_command_surface_audit_report(path: str | Path, result: CommandSurfaceAuditResult) -> None:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(
+        json.dumps(command_surface_result_payload(result), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 
 
@@ -4595,6 +5088,10 @@ def builtin_cbl_contract() -> dict[str, Any]:
             "scripts/dev/audits/audit_phase15_projection_semantics.py",
             "scripts/dev/audits/audit_phase16_projection_generality.py",
             "scripts/dev/audits/audit_phase17_projection_noise.py",
+            "scripts/dev/audits/audit_phase18_projection_dedup.py",
+            "scripts/dev/audits/audit_phase19_projection_roles_imports.py",
+            "src/codebase_lens/contracts/command_surface.py",
+            "scripts/dev/audits/audit_phase20_public_command_stability.py",
 ],
         "required_symbols": [
             {
@@ -7973,15 +8470,61 @@ def _path_role(path: str, profile: ProjectProfile) -> str:
     return "product"
 
 
-def _symbol_role(node: dict[str, Any], profile: ProjectProfile) -> str:
+def _is_cli_handler_label(label: str) -> bool:
+    return label.startswith("_run_")
+
+
+def _is_cli_entrypoint_label(label: str) -> bool:
+    return label in {"main", "build_parser", "create_parser", "make_parser"}
+
+
+def _is_cli_support_label(label: str) -> bool:
+    if label.startswith((
+        "_base_",
+        "_add_",
+        "_common_",
+        "_parser_",
+        "_parse_",
+        "_coerce_",
+        "_resolve_",
+        "_print_",
+        "_format_",
+        "_build_",
+    )):
+        return True
+
+    lowered = label.lower()
+    return any(term in lowered for term in {"arg", "option", "manifest", "namespace", "parser"})
+
+
+def _symbol_role(node: dict[str, Any] | None, profile: ProjectProfile) -> str:
+    if not isinstance(node, dict):
+        return "unknown"
+
     path = _node_path(node)
     label = _node_label(node)
+    kind = _node_kind(node)
     data = _node_data(node)
+
+    if kind == "cli_command":
+        return "cli_command"
+
+    if path in profile.cli_paths:
+        if kind == "file":
+            return "cli_surface"
+        if _is_cli_handler_label(label):
+            return "cli_handler"
+        if _is_cli_entrypoint_label(label):
+            return "cli_entrypoint"
+        if _is_cli_support_label(label):
+            return "cli_support"
+        if label.startswith("_"):
+            return "cli_support"
+        return "cli_support"
+
     blob = " ".join([path, label, str(data.get("signature", ""))]).lower()
     path_role = _path_role(path, profile)
 
-    if path_role == "cli_surface":
-        return "cli_surface"
     if _contains_any(blob, REPORTING_NAME_TERMS):
         return "reporting"
     if _contains_any(blob, ANALYSIS_NAME_TERMS):
@@ -7993,7 +8536,13 @@ def _symbol_role(node: dict[str, Any], profile: ProjectProfile) -> str:
     return path_role
 
 
-def _symbol_score(node: dict[str, Any], incoming: Counter[str], outgoing: Counter[str], profile: ProjectProfile) -> float:
+def _symbol_score(
+    node: dict[str, Any],
+    incoming: Counter[str],
+    outgoing: Counter[str],
+    profile: ProjectProfile,
+    focus_terms: tuple[str, ...] = (),
+) -> float:
     node_id = _node_id(node)
     label = _node_label(node)
     path = _node_path(node)
@@ -8044,10 +8593,23 @@ def _symbol_score(node: dict[str, Any], incoming: Counter[str], outgoing: Counte
     if _is_low_value_path(path):
         score -= 250.0
 
+    focus_blob = " ".join(focus_terms).lower()
+    self_projection_blob = f"{path} {label}".lower()
+    focus_mentions_projection = any(term in focus_blob for term in {"handoff", "projection", "pack"})
+    if "handoff" in self_projection_blob and "projection" in self_projection_blob and not focus_mentions_projection:
+        score -= 90.0
+
     return score
 
 
-def _rank_product_symbols(nodes: list[dict[str, Any]], edges: list[dict[str, Any]], profile: ProjectProfile, *, limit: int) -> list[dict[str, Any]]:
+def _rank_product_symbols(
+    nodes: list[dict[str, Any]],
+    edges: list[dict[str, Any]],
+    profile: ProjectProfile,
+    *,
+    limit: int,
+    focus_terms: tuple[str, ...] = (),
+) -> list[dict[str, Any]]:
     incoming = Counter(str(edge.get("target")) for edge in edges if isinstance(edge, dict) and edge.get("target"))
     outgoing = Counter(str(edge.get("source")) for edge in edges if isinstance(edge, dict) and edge.get("source"))
 
@@ -8062,7 +8624,7 @@ def _rank_product_symbols(nodes: list[dict[str, Any]], edges: list[dict[str, Any
     ranked = sorted(
         symbols,
         key=lambda node: (
-            -_symbol_score(node, incoming, outgoing, profile),
+            -_symbol_score(node, incoming, outgoing, profile, focus_terms=focus_terms),
             _node_path(node),
             _node_label(node),
         ),
@@ -8083,20 +8645,29 @@ def _edge_family(edge: dict[str, Any], source: dict[str, Any] | None, target: di
     kind = str(edge.get("kind") or "")
     source_role = _symbol_role(source, profile) if isinstance(source, dict) else "unknown"
     target_role = _symbol_role(target, profile) if isinstance(target, dict) else "unknown"
-    source_kind = _node_kind(source)
     target_kind = _node_kind(target)
     target_path = _node_path(target)
 
     if kind == "file_declares_cli_command" or target_kind == "cli_command":
         return "cli_to_handler"
 
-    if kind in {"file_imports_module", "module_resolves_to_file"}:
+    if kind in {"file_imports_module", "module_resolves_to_file", "internal_import_dependency"}:
         if target_path and _is_product_path(target_path, profile):
             return "import_dependency"
         return "external_import_dependency"
 
-    if source_role == "cli_surface" and target_role in {"analysis", "model_or_core", "io_or_safety", "product"}:
-        return "handler_to_analysis"
+    if source_role == "cli_entrypoint" and target_role in {"cli_handler", "cli_support", "cli_command"}:
+        return "cli_entrypoint_to_handler"
+
+    if source_role == "cli_handler" and target_role in {"analysis", "model_or_core", "io_or_safety", "product", "reporting"}:
+        return "cli_handler_to_analysis"
+
+    if source_role == "cli_support" and target_role in {"io_or_safety", "model_or_core", "reporting"}:
+        return "cli_support_to_io_or_config"
+
+    if source_role == "cli_support" and target_role in {"analysis", "product"}:
+        return "cli_support_to_analysis"
+
     if source_role in {"analysis", "product"} and target_role == "reporting":
         return "analysis_to_report"
     if source_role == "reporting" and target_role == "reporting":
@@ -8115,20 +8686,26 @@ def _edge_selection_reason(edge: dict[str, Any], family: str) -> str:
 
     if family == "cli_to_handler":
         return "connects command or route declaration to executable surface"
-    if family == "handler_to_analysis":
-        return "connects command-facing handler to analysis or product logic"
+    if family == "cli_entrypoint_to_handler":
+        return "connects CLI parser/entrypoint wiring to command handler surface"
+    if family == "cli_handler_to_analysis":
+        return "connects a concrete command handler to analysis or product logic"
+    if family == "cli_support_to_analysis":
+        return "connects CLI support/configuration helper to analysis logic"
+    if family == "cli_support_to_io_or_config":
+        return "connects CLI support/configuration helper to I/O, Git, or report configuration"
     if family == "analysis_to_report":
         return "connects analysis logic to report generation"
     if family == "report_to_output_writer":
         return "connects reporting layer to output writer or renderer"
     if family == "import_dependency":
-        return "shows internal project import or module dependency"
+        return "shows resolved internal project import dependency"
     if family == "external_import_dependency":
         return "shows external import dependency; normally omitted unless no internal alternatives exist"
     if family == "analysis_to_model":
         return "connects analysis logic to model or core structures"
     if family == "scanner_or_io_flow":
-        return "connects filesystem, scanner, safety, or I/O flow"
+        return "connects filesystem, scanner, safety, Git, or I/O flow"
     if kind == "file_contains_symbol":
         return "fallback declaration context for a product symbol"
     return "high-scoring product dependency edge"
@@ -8157,6 +8734,8 @@ def _edge_relevance_score(edge: dict[str, Any], nodes_by_id: dict[str, dict[str,
 
     if kind == "symbol_calls_symbol":
         score += 150.0
+    elif kind == "internal_import_dependency":
+        score += 130.0
     elif kind == "file_declares_cli_command":
         score += 120.0
     elif kind == "file_imports_module":
@@ -8167,12 +8746,16 @@ def _edge_relevance_score(edge: dict[str, Any], nodes_by_id: dict[str, dict[str,
         score += 10.0
 
     family_bonus = {
-        "handler_to_analysis": 100.0,
+        "cli_handler_to_analysis": 105.0,
+        "handler_to_analysis": 95.0,
         "analysis_to_report": 90.0,
         "analysis_to_model": 80.0,
-        "scanner_or_io_flow": 70.0,
-        "cli_to_handler": 65.0,
-        "import_dependency": 55.0,
+        "scanner_or_io_flow": 75.0,
+        "cli_support_to_io_or_config": 65.0,
+        "cli_support_to_analysis": 60.0,
+        "cli_entrypoint_to_handler": 60.0,
+        "cli_to_handler": 55.0,
+        "import_dependency": 70.0,
         "report_to_output_writer": 35.0,
         "other_product_flow": 20.0,
         "declaration_context": 0.0,
@@ -8180,8 +8763,10 @@ def _edge_relevance_score(edge: dict[str, Any], nodes_by_id: dict[str, dict[str,
     }
     score += family_bonus.get(family, 0.0)
 
-    if source_role in {"analysis", "reporting", "cli_surface"}:
+    if source_role in {"analysis", "reporting", "cli_handler", "cli_entrypoint"}:
         score += 35.0
+    if source_role == "cli_support":
+        score += 10.0
     if target_role in {"analysis", "reporting", "model_or_core", "io_or_safety"}:
         score += 35.0
 
@@ -8192,6 +8777,9 @@ def _edge_relevance_score(edge: dict[str, Any], nodes_by_id: dict[str, dict[str,
         score += 35.0
     if target_label.startswith(("write_", "build_", "collect_", "query_", "render_", "parse_", "scan_", "analyze_")):
         score += 35.0
+
+    if source_role == "cli_support" and family in {"cli_handler_to_analysis", "handler_to_analysis"}:
+        score -= 150.0
 
     return score
 
@@ -8218,18 +8806,329 @@ def _edge_payload(edge: dict[str, Any], nodes_by_id: dict[str, dict[str, Any]], 
     }
 
 
-def _representative_edges(nodes: list[dict[str, Any]], edges: list[dict[str, Any]], profile: ProjectProfile, *, limit: int) -> list[dict[str, Any]]:
+def _representative_edge_key(payload: dict[str, Any]) -> tuple[str, str, str, str]:
+    return (
+        str(payload.get("kind") or ""),
+        str(payload.get("source") or ""),
+        str(payload.get("target") or ""),
+        str(payload.get("edge_family") or ""),
+    )
+
+
+def _collapse_representative_edge_candidates(
+    ranked_edges: list[dict[str, Any]],
+    nodes_by_id: dict[str, dict[str, Any]],
+    profile: ProjectProfile,
+) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+
+    for edge in ranked_edges:
+        payload = _edge_payload(edge, nodes_by_id, profile)
+        key = _representative_edge_key(payload)
+        evidence = str(payload.get("evidence") or "")
+        score = float(payload.get("relevance_score") or 0.0)
+
+        if key not in groups:
+            groups[key] = {
+                "payload": payload,
+                "best_score": score,
+                "evidence_count": 0,
+                "sample_evidence": [],
+            }
+
+        group = groups[key]
+        group["evidence_count"] = int(group["evidence_count"]) + 1
+
+        samples = group["sample_evidence"]
+        if evidence and evidence not in samples:
+            samples.append(evidence)
+
+        if score > float(group["best_score"]):
+            group["payload"] = payload
+            group["best_score"] = score
+
+    collapsed: list[dict[str, Any]] = []
+    for group in groups.values():
+        payload = dict(group["payload"])
+        samples = list(group["sample_evidence"])[:5]
+        payload["evidence_count"] = int(group["evidence_count"])
+        payload["sample_evidence"] = samples
+        if samples:
+            payload["evidence"] = samples[0]
+        collapsed.append(payload)
+
+    return sorted(
+        collapsed,
+        key=lambda item: (
+            -float(item.get("relevance_score") or 0.0),
+            -int(item.get("evidence_count") or 0),
+            str(item.get("edge_family") or ""),
+            str(item.get("source") or ""),
+            str(item.get("target") or ""),
+        ),
+    )
+
+
+def _module_name_from_source_path(path: str, profile: ProjectProfile) -> str:
+    normalized = path.replace("\\", "/")
+    if not normalized.endswith(".py"):
+        return ""
+
+    for prefix in profile.source_prefixes:
+        if normalized.startswith(prefix):
+            relative = normalized[len(prefix):]
+            prefix_parts = _path_parts(prefix.rstrip("/"))
+            package = prefix_parts[-1] if prefix_parts else ""
+            module_parts = list(_path_parts(relative))
+            if not module_parts:
+                return package
+            leaf = module_parts[-1]
+            if leaf == "__init__.py":
+                module_parts = module_parts[:-1]
+            elif leaf.endswith(".py"):
+                module_parts[-1] = leaf[:-3]
+            if package:
+                return ".".join([package, *module_parts])
+            return ".".join(module_parts)
+
+    return ""
+
+
+def _file_node_for_path(path: str, nodes: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for node in nodes:
+        if isinstance(node, dict) and node.get("kind") == "file" and _node_path(node) == path:
+            return node
+    return None
+
+
+def _import_record_source_path(record: dict[str, Any]) -> str:
+    for key in ("path", "file_path", "source_path", "source_file", "file"):
+        value = record.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def _import_record_module(record: dict[str, Any]) -> str:
+    for key in ("module", "imported_module", "target_module", "name", "qualified_name", "module_name"):
+        value = record.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def _import_record_line(record: dict[str, Any]) -> int | None:
+    for key in ("line", "lineno", "line_number", "start_line"):
+        value = record.get(key)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+    return None
+
+
+def _import_record_evidence(record: dict[str, Any], source_path: str) -> str:
+    evidence = record.get("evidence")
+    if isinstance(evidence, str) and evidence:
+        return evidence
+    line = _import_record_line(record)
+    if line is not None:
+        return f"{source_path}:L{line}-L{line}"
+    return source_path
+
+
+def _import_record_resolved_path(record: dict[str, Any]) -> str:
+    for key in ("resolved_path", "resolved_file", "resolved_module_path", "target_path", "target_file", "path_resolved"):
+        value = record.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def _extract_import_records(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    candidates: list[Any] = []
+    for key in ("imports", "records", "import_records", "items"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            candidates.extend(value)
+
+    if not candidates:
+        graph = payload.get("graph")
+        if isinstance(graph, dict):
+            for key in ("imports", "records", "import_records", "items"):
+                value = graph.get(key)
+                if isinstance(value, list):
+                    candidates.extend(value)
+
+    return [item for item in candidates if isinstance(item, dict)]
+
+
+def _read_import_records(layout: OutputLayout) -> list[dict[str, Any]]:
+    payload = _read_json(layout.latest_dir / "import_graph.json")
+    return _extract_import_records(payload)
+
+
+def _module_file_lookup(nodes: list[dict[str, Any]], profile: ProjectProfile) -> dict[str, dict[str, Any]]:
+    lookup: dict[str, dict[str, Any]] = {}
+    for node in nodes:
+        if not isinstance(node, dict) or node.get("kind") != "file":
+            continue
+        path = _node_path(node)
+        if not _is_product_path(path, profile):
+            continue
+        module = _module_name_from_source_path(path, profile)
+        if module:
+            lookup[module] = node
+    return lookup
+
+
+def _resolved_internal_import_payloads(
+    *,
+    layout: OutputLayout,
+    nodes: list[dict[str, Any]],
+    profile: ProjectProfile,
+) -> list[dict[str, Any]]:
+    module_lookup = _module_file_lookup(nodes, profile)
+    file_lookup = {_node_path(node): node for node in nodes if isinstance(node, dict) and node.get("kind") == "file"}
+    records = _read_import_records(layout)
+
+    payloads: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    for record in records:
+        source_path = _import_record_source_path(record)
+        module = _import_record_module(record)
+        resolved_path = _import_record_resolved_path(record)
+
+        if not source_path or not _is_product_path(source_path, profile):
+            continue
+
+        target_node: dict[str, Any] | None = None
+        if resolved_path and _is_product_path(resolved_path, profile):
+            target_node = file_lookup.get(resolved_path) or {"kind": "file", "path": resolved_path, "label": resolved_path}
+        elif module in module_lookup:
+            target_node = module_lookup[module]
+        elif module:
+            # Try longest-prefix resolution for imports of symbols from modules.
+            parts = module.split(".")
+            for end in range(len(parts), 0, -1):
+                candidate = ".".join(parts[:end])
+                if candidate in module_lookup:
+                    target_node = module_lookup[candidate]
+                    break
+
+        if not target_node:
+            continue
+
+        target_path = _node_path(target_node)
+        if not target_path or target_path == source_path or not _is_product_path(target_path, profile):
+            continue
+
+        key = (source_path, module, target_path)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        source_node = file_lookup.get(source_path) or {"kind": "file", "path": source_path, "label": source_path}
+        evidence = _import_record_evidence(record, source_path)
+
+        payloads.append(
+            {
+                "kind": "internal_import_dependency",
+                "source": _display_node(source_node, fallback=source_path),
+                "target": _display_node(target_node, fallback=target_path),
+                "source_path": source_path,
+                "target_path": target_path,
+                "source_role": _path_role(source_path, profile),
+                "target_role": _path_role(target_path, profile),
+                "confidence": record.get("confidence") or "exact_import_statement",
+                "evidence": evidence,
+                "edge_family": "import_dependency",
+                "selection_reason": "shows resolved internal project import dependency",
+                "relevance_score": 505.0,
+                "imported_module": module,
+            }
+        )
+
+    return payloads
+
+
+def _representative_edge_key(payload: dict[str, Any]) -> tuple[str, str, str, str]:
+    return (
+        str(payload.get("kind") or ""),
+        str(payload.get("source") or ""),
+        str(payload.get("target") or ""),
+        str(payload.get("edge_family") or ""),
+    )
+
+
+def _collapse_representative_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+
+    for payload in payloads:
+        key = _representative_edge_key(payload)
+        evidence = str(payload.get("evidence") or "")
+        score = float(payload.get("relevance_score") or 0.0)
+
+        if key not in groups:
+            groups[key] = {
+                "payload": dict(payload),
+                "best_score": score,
+                "evidence_count": 0,
+                "sample_evidence": [],
+            }
+
+        group = groups[key]
+        group["evidence_count"] = int(group["evidence_count"]) + 1
+
+        samples = group["sample_evidence"]
+        if evidence and evidence not in samples:
+            samples.append(evidence)
+
+        if score > float(group["best_score"]):
+            group["payload"] = dict(payload)
+            group["best_score"] = score
+
+    collapsed: list[dict[str, Any]] = []
+    for group in groups.values():
+        payload = dict(group["payload"])
+        samples = list(group["sample_evidence"])[:5]
+        payload["evidence_count"] = int(group["evidence_count"])
+        payload["sample_evidence"] = samples
+        if samples:
+            payload["evidence"] = samples[0]
+        collapsed.append(payload)
+
+    return sorted(
+        collapsed,
+        key=lambda item: (
+            -float(item.get("relevance_score") or 0.0),
+            -int(item.get("evidence_count") or 0),
+            str(item.get("edge_family") or ""),
+            str(item.get("source") or ""),
+            str(item.get("target") or ""),
+        ),
+    )
+
+
+def _representative_edges(
+    nodes: list[dict[str, Any]],
+    edges: list[dict[str, Any]],
+    profile: ProjectProfile,
+    *,
+    limit: int,
+    layout: OutputLayout | None = None,
+) -> list[dict[str, Any]]:
     nodes_by_id = _node_by_id(nodes)
 
     allowed = {
         "symbol_calls_symbol",
         "file_declares_cli_command",
-        "file_imports_module",
         "module_resolves_to_file",
         "file_contains_symbol",
     }
 
-    raw_candidates: list[dict[str, Any]] = []
+    payload_candidates: list[dict[str, Any]] = []
     fallback_external_imports: list[dict[str, Any]] = []
 
     for edge in edges:
@@ -8237,6 +9136,17 @@ def _representative_edges(nodes: list[dict[str, Any]], edges: list[dict[str, Any
             continue
 
         kind = str(edge.get("kind") or "")
+        if kind == "file_imports_module":
+            source = _source_node(edge, nodes_by_id)
+            target = _target_node(edge, nodes_by_id)
+            source_path = _node_path(source)
+            target_path = _node_path(target)
+            if _is_product_path(source_path, profile) and target_path and _is_product_path(target_path, profile):
+                payload_candidates.append(_edge_payload(edge, nodes_by_id, profile))
+            elif _is_product_path(source_path, profile):
+                fallback_external_imports.append(_edge_payload(edge, nodes_by_id, profile))
+            continue
+
         if kind not in allowed:
             continue
 
@@ -8248,68 +9158,74 @@ def _representative_edges(nodes: list[dict[str, Any]], edges: list[dict[str, Any
         if not (_is_product_path(source_path, profile) or _is_product_path(target_path, profile)):
             continue
 
-        if kind in {"file_imports_module", "module_resolves_to_file"}:
+        if kind in {"module_resolves_to_file"}:
             if not target_path or not _is_product_path(target_path, profile):
-                fallback_external_imports.append(edge)
+                fallback_external_imports.append(_edge_payload(edge, nodes_by_id, profile))
                 continue
 
         if kind == "file_contains_symbol" and not _is_product_path(source_path, profile):
             continue
 
-        raw_candidates.append(edge)
+        payload_candidates.append(_edge_payload(edge, nodes_by_id, profile))
 
-    if not raw_candidates:
-        raw_candidates = fallback_external_imports
+    if layout is not None:
+        payload_candidates.extend(
+            _resolved_internal_import_payloads(
+                layout=layout,
+                nodes=nodes,
+                profile=profile,
+            )
+        )
 
-    ranked = sorted(
-        raw_candidates,
-        key=lambda edge: (
-            -_edge_relevance_score(edge, nodes_by_id, profile),
-            str(edge.get("kind") or ""),
-            _edge_evidence(edge),
-            str(edge.get("source") or ""),
-            str(edge.get("target") or ""),
-        ),
-    )
+    if not payload_candidates:
+        payload_candidates = fallback_external_imports
+
+    ranked = _collapse_representative_payloads(payload_candidates)
 
     family_caps = {
-        "cli_to_handler": 4,
-        "handler_to_analysis": 5,
-        "analysis_to_report": 4,
-        "report_to_output_writer": 3,
-        "import_dependency": 4,
-        "external_import_dependency": 1,
-        "analysis_to_model": 4,
+        "cli_entrypoint_to_handler": 2,
+        "cli_handler_to_analysis": 4,
+        "cli_support_to_analysis": 2,
+        "cli_support_to_io_or_config": 2,
+        "handler_to_analysis": 2,
+        "cli_to_handler": 2,
+        "analysis_to_model": 3,
         "scanner_or_io_flow": 3,
-        "declaration_context": 2,
-        "other_product_flow": 4,
+        "analysis_to_report": 3,
+        "report_to_output_writer": 2,
+        "import_dependency": 3,
+        "external_import_dependency": 1,
+        "declaration_context": 1,
+        "other_product_flow": 3,
     }
+
+    coverage_order = [
+        "cli_handler_to_analysis",
+        "cli_support_to_analysis",
+        "cli_support_to_io_or_config",
+        "analysis_to_model",
+        "scanner_or_io_flow",
+        "analysis_to_report",
+        "report_to_output_writer",
+        "cli_entrypoint_to_handler",
+        "cli_to_handler",
+        "import_dependency",
+        "other_product_flow",
+        "declaration_context",
+        "external_import_dependency",
+    ]
 
     selected_edges: list[dict[str, Any]] = []
     selected_keys: set[tuple[str, str, str, str]] = set()
     family_counts: Counter[str] = Counter()
 
-    families_present: list[str] = []
-    for edge in ranked:
-        source = _source_node(edge, nodes_by_id)
-        target = _target_node(edge, nodes_by_id)
-        family = _edge_family(edge, source, target, profile)
-        if family not in families_present:
-            families_present.append(family)
-
-    def add(edge: dict[str, Any]) -> bool:
-        payload = _edge_payload(edge, nodes_by_id, profile)
-        key = (
-            str(payload.get("kind")),
-            str(payload.get("source")),
-            str(payload.get("target")),
-            str(payload.get("evidence")),
-        )
+    def add(payload: dict[str, Any]) -> bool:
+        key = _representative_edge_key(payload)
         if key in selected_keys:
             return False
 
-        family = str(payload["edge_family"])
-        if family_counts[family] >= family_caps.get(family, 3):
+        family = str(payload.get("edge_family") or "")
+        if family_counts[family] >= family_caps.get(family, 2):
             return False
 
         selected_edges.append(payload)
@@ -8317,20 +9233,18 @@ def _representative_edges(nodes: list[dict[str, Any]], edges: list[dict[str, Any
         family_counts[family] += 1
         return True
 
-    for family in families_present:
-        for edge in ranked:
-            source = _source_node(edge, nodes_by_id)
-            target = _target_node(edge, nodes_by_id)
-            if _edge_family(edge, source, target, profile) == family:
-                add(edge)
+    for family in coverage_order:
+        for payload in ranked:
+            if payload.get("edge_family") == family:
+                add(payload)
                 break
-        if len(selected_edges) >= min(limit, len(families_present)):
-            break
-
-    for edge in ranked:
         if len(selected_edges) >= limit:
             break
-        add(edge)
+
+    for payload in ranked:
+        if len(selected_edges) >= limit:
+            break
+        add(payload)
 
     return selected_edges[:limit]
 
@@ -8536,7 +9450,7 @@ def _projection_payload(
     return {
         "schema": {
             "name": "cbl.handoff_projection",
-            "version": 3,
+            "version": 5,
         },
         "issue": issue,
         "scope": "changed" if changed_only else "full",
@@ -8568,7 +9482,7 @@ def _projection_payload(
                     "role": _symbol_role(node, profile),
                     "signature": _node_data(node).get("signature"),
                 }
-                for node in _rank_product_symbols(nodes, edges, profile, limit=12)
+                for node in _rank_product_symbols(nodes, edges, profile, limit=12, focus_terms=focus_terms)
             ],
             "entrypoints": [
                 {
@@ -8580,7 +9494,7 @@ def _projection_payload(
                 }
                 for node in _entrypoints(nodes, limit=18)
             ],
-            "representative_edges": _representative_edges(nodes, edges, profile, limit=20),
+            "representative_edges": _representative_edges(nodes, edges, profile, limit=20, layout=layout),
             "unresolved_static_calls": unresolved_groups["dynamic_or_dispatch_calls"],
             **unresolved_groups,
         },
@@ -8702,17 +9616,23 @@ def _render_projection_markdown(payload: dict[str, Any]) -> str:
         for item in representative_edges:
             if not isinstance(item, dict):
                 continue
-            evidence = f" Evidence: `{item.get('evidence')}`." if item.get("evidence") else ""
+            sample_evidence = _as_list(item.get("sample_evidence"))
+            evidence = sample_evidence[0] if sample_evidence else item.get("evidence")
+            evidence_count = int(item.get("evidence_count") or (1 if evidence else 0))
+            evidence_text = f" Evidence: `{evidence}`." if evidence else ""
             lines.append(
                 _bullet(
                     f"`{item.get('kind')}`: `{item.get('source')}` → `{item.get('target')}` "
-                    f"[{item.get('confidence')}].{evidence}"
+                    f"[{item.get('confidence')}].{evidence_text}"
                 )
             )
             lines.append(
                 f"  - Family: `{item.get('edge_family')}`; reason: {item.get('selection_reason')}; "
                 f"score: `{item.get('relevance_score')}`; roles: `{item.get('source_role')}` → `{item.get('target_role')}`"
             )
+            if evidence_count > 1:
+                shown = ", ".join(f"`{value}`" for value in sample_evidence[:3])
+                lines.append(f"  - Evidence count: `{evidence_count}`; sample evidence: {shown}")
     else:
         lines.append("- No representative product dependency edges were selected.")
 
