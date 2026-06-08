@@ -300,6 +300,20 @@ def write_handoff_pack(
     handoff_path.write_text("\n".join(markdown_lines).rstrip() + "\n", encoding="utf-8", newline="\n")
     outputs["ai_handoff_md"] = ".codecontext/latest/ai_handoff.md"
 
+    from codebase_lens.reports.handoff_projection import write_handoff_projection_reports
+
+    outputs.update(
+        write_handoff_projection_reports(
+            layout,
+            issue=issue,
+            changed_only=changed_only,
+            budget=budget,
+            focus_terms=focus_terms,
+            counts=counts,
+            warnings=tuple(warnings),
+        )
+    )
+
     _write_pack_index(
         layout,
         issue=issue,

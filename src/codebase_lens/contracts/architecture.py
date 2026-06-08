@@ -77,6 +77,9 @@ def builtin_cbl_contract() -> dict[str, Any]:
             "src/codebase_lens/analyzers/graph_query.py",
             "src/codebase_lens/reports/graph_query.py",
             "scripts/dev/audits/audit_phase12_graph_query.py",
+            "src/codebase_lens/reports/handoff_projection.py",
+            "scripts/dev/audits/audit_phase13_handoff_projection_sidecar.py",
+            "scripts/dev/audits/audit_phase14_projection_relevance.py",
 ],
         "required_symbols": [
             {
@@ -188,6 +191,13 @@ def builtin_cbl_contract() -> dict[str, Any]:
                 "symbols": [
                     "write_graph_query_reports",
                     "render_graph_query_markdown",
+                ],
+            },
+            {
+                "path": "src/codebase_lens/reports/handoff_projection.py",
+                "symbols": [
+                    "HandoffProjectionResult",
+                    "write_handoff_projection_reports",
                 ],
             },
 ],
