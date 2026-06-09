@@ -107,6 +107,9 @@ def builtin_cbl_contract() -> dict[str, Any]:
             "scripts/dev/audits/audit_phase27_reliability_corrections.py",
             "scripts/dev/audits/audit_phase28_manifest_consistency.py",
             "scripts/dev/audits/audit_phase29_dump_diffdump.py",
+            "tests/test_installation_docs.py",
+            "scripts/dev/audits/audit_phase30_installation_docs.py",
+            "docs/INSTALLATION.md",
             "src/codebase_lens/reports/diffdump.py",
             "src/codebase_lens/reports/dump.py",
             "src/codebase_lens/analyzers/docstrings.py",
@@ -298,6 +301,16 @@ def builtin_cbl_contract() -> dict[str, Any]:
             {
                 "path": "scripts/dev/audits/audit_phase29_dump_diffdump.py",
                 "symbols": ["DumpDiffdumpIssue", "DumpDiffdumpResult", "run_dump_diffdump_audit", "main"],
+            },
+
+            {
+                "path": "scripts/dev/audits/audit_phase30_installation_docs.py",
+                "symbols": [
+                    "InstallationDocsIssue",
+                    "InstallationDocsAuditResult",
+                    "run_installation_docs_audit",
+                    "main",
+                ],
             },
 ],
         "forbidden_imports": [

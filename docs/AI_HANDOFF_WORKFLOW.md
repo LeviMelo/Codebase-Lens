@@ -1,97 +1,65 @@
-# AI Handoff Workflow
+# CBL AI Handoff Workflow
 
-CBL exists to make chatbot-assisted coding less dependent on memory and more dependent on current local repository evidence.
+CBL exists to make AI-mediated development evidence-driven. Do not rely on a chatbot's memory of a repository when the codebase has changed.
 
-## Recommended handoff flow
+## Standard handoff
 
-Run:
+```powershell
+cd C:\path\to\target\repo
+conda activate cbl-dev
+cbl pack --issue "state the concrete coding task" --budget 32000 --no-archive
+```
 
-~~~powershell
-python -m codebase_lens pack --issue "precise coding task or review question" --budget 24000 --no-archive
-~~~
+Give the assistant:
 
-Then give the chatbot the relevant files from:
-
-~~~text
+```text
 .codecontext/latest/ai_handoff.md
 .codecontext/latest/handoff_projection.md
-.codecontext/latest/handoff_projection.json
-.codecontext/latest/graph_summary.md
-~~~
+.codecontext/latest/manifest.json
+```
 
-Use `ai_handoff.md` for broad project state.
+## Large-source search handoff
 
-Use `handoff_projection.md` when the chatbot needs a compact dependency-oriented reading plan.
+Use `dump` when the assistant or platform can search a large uploaded file and needs full source text.
 
-Use `handoff_projection.json` when the chatbot should reason over machine-readable graph edges, roles, source prefixes, unresolved calls, and representative dependencies.
+```powershell
+cbl dump --no-archive
+```
 
-Use `graph_summary.md` when the chatbot needs a repository-level evidence graph overview.
+Give the assistant:
 
-## Changed-scope handoff
+```text
+.codecontext/latest/codebase_dump.md
+.codecontext/latest/codebase_dump_index.json
+```
 
-For uncommitted work:
+The dump is intentionally source-first. Included files are not truncated. Data files, generated dump files, `.codecontext/`, binaries, and hard-excluded paths remain excluded.
 
-~~~powershell
-python -m codebase_lens pack --changed --issue "review current uncommitted changes" --budget 24000 --no-archive
-~~~
+## Diff review handoff
 
-Changed-scope packs are useful for:
+Use `diffdump` when the question is about what changed between Git refs.
 
-- reviewing a patch;
-- explaining what changed;
-- asking whether a slice respects the architecture;
-- generating the next updater script from current repository state.
+```powershell
+cbl diffdump --from v0.1.0 --to HEAD --symbols --no-archive
+```
 
-## Focused graph handoff
+Give the assistant:
 
-For a specific symbol:
+```text
+.codecontext/latest/diff_dump.md
+.codecontext/latest/diff_dump_index.json
+.codecontext/latest/diff.json
+```
 
-~~~powershell
-python -m codebase_lens graph --symbol SYMBOL_NAME --depth 1 --limit 60 --no-archive
-~~~
+## Follow-up context
 
-For a specific file:
+For targeted follow-up:
 
-~~~powershell
-python -m codebase_lens graph --path src/codebase_lens/path/to/file.py --depth 1 --limit 60 --no-archive
-~~~
+```powershell
+cbl symbol SomeFunction --path src/package/module.py --context 80 --no-archive
+cbl file src/package/module.py --lines 1:240 --no-archive
+cbl graph --symbol SomeFunction --depth 1 --limit 100 --no-archive
+cbl callers SomeFunction --no-archive
+```
 
-For changed work:
-
-~~~powershell
-python -m codebase_lens graph --changed --depth 1 --limit 80 --no-archive
-~~~
-
-## What to tell the chatbot
-
-A good prompt should say:
-
-~~~text
-Use the attached CBL output as current repository evidence. Treat path and line evidence as more reliable than memory. Do not assume files or symbols exist unless they appear in the CBL reports. Preserve the architecture contract. Provide changes as updater scripts where possible.
-~~~
-
-For implementation slices, prefer:
-
-~~~text
-Write a repo-root updater script under scripts/dev/updaters/. The updater must modify production code under src/codebase_lens/ where appropriate, add or update audits/tests, parse every modified Python file before exiting, and provide exact validation commands.
-~~~
-
-## What not to do
-
-Do not paste raw source trees when CBL reports are sufficient.
-
-Do not ask a chatbot to infer the current codebase from memory.
-
-Do not treat `.codecontext/latest/` as stable storage. It is overwritten by later commands.
-
-Do not ask the chatbot to weaken the architecture contract to pass tests unless the contract itself is demonstrably wrong.
-
-## Audit reports
-
-Stable release audit reports are written to:
-
-~~~text
-.codecontext/audits/
-~~~
-
-These are sanitized before persistence. They are intended to be pasteable diagnostics for command-surface, fixture-matrix, and release-safety gates.
+Treat exact line-numbered excerpts as authoritative. Treat heuristic graph and likely-test findings as provisional.

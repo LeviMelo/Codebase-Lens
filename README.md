@@ -1,161 +1,228 @@
-# Local Codebase Lens
+# Local Codebase Lens (CBL)
 
-Local Codebase Lens, abbreviated CBL, is a local-only repository inspection tool for AI-assisted coding work.
+Local Codebase Lens is a local static repository-evidence tool for AI-assisted coding. It scans a repository from the current working directory, builds source-grounded reports, and writes them under `.codecontext/` so a chatbot can inspect the project with less guessing and less stale-memory drift.
 
-CBL does not patch code, generate application changes, upload repository contents, or execute the target application package. Its job is to inspect a local repository and emit structured, evidence-backed reports under `.codecontext/` so a developer can hand current repository context to a chatbot without relying on stale memory.
+CBL is local-only and does not upload your code. Review generated AI handoff reports before sharing them.
 
-## Current status
+## What CBL does
 
-This repository is at the v0.1 release-candidate stage.
+CBL builds an evidence package from local files and Git state. It can produce repository snapshots, source trees, Python symbol indexes, import indexes, static CLI and route inventories, test inventories, changed-file reports, changed-symbol reports, graph neighborhoods, AI handoff packs, full source dumps, and Git diff dumps.
 
-The current implementation includes:
+CBL does not import or execute the target repository. It reads text, parses Python with `ast`, runs Git commands, applies hard exclusions, redacts secret-like values before report persistence, and reports omitted files explicitly.
 
-- repository root detection with explicit `--repo` support;
-- hard-exclusion of `.git`, `.codecontext`, virtual environments, data/output/cache folders, binary artifacts, and sensitive file classes;
-- static Python symbol extraction;
-- static import extraction with project import resolution;
-- static CLI, route, test, caller, changed-file, changed-symbol, symbol-graph, evidence-graph, and graph-query reports;
-- AI handoff pack generation;
-- handoff projection sidecar reports;
-- architecture contract validation;
-- command-surface release gate;
-- external fixture-matrix release gate;
-- hostile safety-fixture release gate;
-- stable sanitized audit reports under `.codecontext/audits/`.
+The main commands are:
 
-## Installation for local development
+```text
+cbl doctor
+cbl snapshot
+cbl tree
+cbl symbols
+cbl imports
+cbl cli
+cbl routes
+cbl tests
+cbl diff
+cbl changed
+cbl file
+cbl symbol
+cbl callers
+cbl contract
+cbl pack
+cbl clean
+cbl graph
+cbl dump
+cbl diffdump
+```
 
-From the repository root:
+## Installation for PowerShell
 
-~~~powershell
+The preferred installation is an editable Python package inside the dedicated Conda environment.
+
+```powershell
+cd C:\Users\Galaxy\LEVI\projects\CBL
 conda activate cbl-dev
-$env:PYTHONPATH = (Resolve-Path .\src).Path
-python -m codebase_lens --help
-~~~
+python -m pip install -e .
+cbl --help
+cbl doctor --no-archive
+```
 
-CBL is currently intended to be run from source during development. The canonical module entrypoint is:
+After this, `cbl` is available from any directory while `cbl-dev` is active. This is the correct meaning of "global" for this project: the command is installed into the environment's `Scripts` directory, and that directory is placed on `PATH` when the environment is activated.
 
-~~~powershell
-python -m codebase_lens <command> [options]
-~~~
+Use it from another repository like this:
 
-## Basic usage
+```powershell
+cd C:\Users\Galaxy\LEVI\projects\SomeOtherRepo
+conda activate cbl-dev
+cbl doctor --no-archive
+cbl pack --issue "review this codebase for architecture and implementation risks" --budget 32000 --no-archive
+```
 
-Create a full AI handoff pack for the current repository:
+Without activating the environment, use:
 
-~~~powershell
-python -m codebase_lens pack --issue "describe the coding task here" --budget 24000 --no-archive
-~~~
+```powershell
+conda run -n cbl-dev cbl doctor --no-archive
+conda run -n cbl-dev cbl pack --repo C:\path\to\repo --issue "handoff" --budget 32000 --no-archive
+```
 
-Create a changed-scope pack:
+Do not solve this by copying CBL source files into random PATH folders. The package entry point is the canonical launcher.
 
-~~~powershell
-python -m codebase_lens pack --changed --issue "review current uncommitted changes" --budget 24000 --no-archive
-~~~
+## Normal AI handoff workflow
 
-Run the architecture contract:
+Generate a fresh pack before asking a chatbot to modify or review a project:
 
-~~~powershell
-python -m codebase_lens contract --no-archive
-~~~
+```powershell
+cd C:\path\to\target\repo
+conda activate cbl-dev
+cbl pack --issue "implement the requested change without violating the architecture" --budget 32000 --no-archive
+```
 
-Query the evidence graph:
+Then provide these files to the chatbot:
 
-~~~powershell
-python -m codebase_lens graph --symbol write_handoff_pack --depth 1 --limit 60 --no-archive
-~~~
-
-Run against another local repository:
-
-~~~powershell
-python -m codebase_lens pack --repo C:\path\to\other\repo --issue "handoff for external repo" --budget 24000 --no-archive
-~~~
-
-## Main outputs
-
-The latest command writes to:
-
-~~~text
-.codecontext/latest/
-~~~
-
-Important pack outputs include:
-
-~~~text
+```text
 .codecontext/latest/ai_handoff.md
 .codecontext/latest/handoff_projection.md
-.codecontext/latest/handoff_projection.json
-.codecontext/latest/pack_index.json
-.codecontext/latest/evidence_graph.json
-.codecontext/latest/graph_summary.md
-.codecontext/latest/symbol_graph.json
-.codecontext/latest/symbol_graph.md
-.codecontext/latest/file_inventory.json
 .codecontext/latest/manifest.json
-~~~
+```
 
-Release audit reports are also persisted under:
+For larger or retrieval-oriented workflows, also generate a full source dump:
 
-~~~text
-.codecontext/audits/
-~~~
+```powershell
+cbl dump --no-archive
+```
 
-These stable audit reports are sanitized before persistence and should not contain raw local user-home or temp-directory paths.
+Main output:
 
-## Public commands
+```text
+.codecontext/latest/codebase_dump.md
+.codecontext/latest/codebase_dump_index.json
+```
 
-The current public command surface is:
+For changes between Git refs:
 
-~~~text
-doctor
-snapshot
-tree
-symbols
-imports
-cli
-routes
-tests
-diff
-changed
-file
-symbol
-callers
-contract
-pack
-clean
-graph
-~~~
+```powershell
+cbl diffdump --from HEAD~1 --to HEAD --symbols --no-archive
+```
 
-The public command stability audit enforces parity between `PUBLIC_COMMANDS` and argparse subcommands.
+Main output:
+
+```text
+.codecontext/latest/diff_dump.md
+.codecontext/latest/diff_dump_index.json
+```
+
+## Important commands
+
+`cbl snapshot` writes a broad repository state bundle.
+
+```powershell
+cbl snapshot --budget 32000 --no-archive
+```
+
+`cbl pack` writes the primary AI handoff pack.
+
+```powershell
+cbl pack --issue "describe the intended coding task" --budget 32000 --no-archive
+```
+
+`cbl graph` writes a scoped graph neighborhood around a symbol, path, module, or changed files.
+
+```powershell
+cbl graph --symbol write_snapshot_bundle --depth 1 --limit 100 --unresolved seed --no-archive
+```
+
+`cbl dump` writes a Markdown source corpus. It is source-first and untruncated for included files.
+
+```powershell
+cbl dump --no-archive
+cbl dump --include-untracked --out-file codebase_dump.md --no-archive
+```
+
+`cbl diffdump` writes a Markdown patch corpus for a Git comparison.
+
+```powershell
+cbl diffdump --from v0.1.0 --to HEAD --symbols --unified 5 --no-archive
+```
+
+`cbl contract` checks CBL against its built-in architecture contract.
+
+```powershell
+cbl contract --no-archive
+```
+
+## Output layout
+
+CBL writes the current command output to:
+
+```text
+.codecontext/latest/
+```
+
+Unless `--no-archive` is used, CBL also copies the latest output to:
+
+```text
+.codecontext/runs/<timestamp>/
+```
+
+During active development, prefer `--no-archive` to avoid noisy local artifacts.
 
 ## Safety model
 
-CBL is intentionally conservative.
+CBL is designed for local personal use. It enforces these rules:
 
-By default it rejects paths outside the repository root, refuses hard-excluded paths, avoids scanning `.codecontext`, avoids common data/output/cache directories, skips binary files, skips oversized files, and redacts secret-like assignments in emitted text.
+```text
+- no target repository import or execution
+- no upload behavior
+- no recursive scanning of .codecontext/
+- hard exclusion of secrets, environments, caches, data, build outputs, and generated artifacts
+- binary and unsafe text detection
+- redaction before report persistence
+- repository-relative paths in AI-facing reports by default
+- explicit omitted-file accounting
+```
 
-CBL analyzes Python source statically. It must not import or execute the target repository package to discover symbols, CLI handlers, routes, tests, or imports.
+`dump` and `diffdump` intentionally emit more source text than `pack`. Review their outputs before sharing them.
 
-## Development doctrine
+## Development validation
 
-Production behavior belongs under `src/codebase_lens/`.
+For the CBL repository itself:
 
-Developer scripts under `scripts/dev/` may orchestrate updates and audits, but they must not become the product implementation. Audits should protect architecture and behavior; they should not replace production code.
-
-## Release gates
-
-The current release gate sequence is documented in `docs/RELEASE_CHECKLIST.md`.
-
-For normal development, run:
-
-~~~powershell
+```powershell
+cd C:\Users\Galaxy\LEVI\projects\CBL
+conda activate cbl-dev
 $env:PYTHONPATH = (Resolve-Path .\src).Path
-python .\scripts\dev\audits\audit_phase24_documentation_workflow.py
-python .\scripts\dev\audits\audit_phase23_audit_report_sanitization.py
-python .\scripts\dev\audits\audit_phase22_release_safety.py
-python .\scripts\dev\audits\audit_phase21_release_fixture_matrix.py
-python .\scripts\dev\audits\audit_phase20_public_command_stability.py
+
 python -m codebase_lens contract --no-archive
 python -m pytest
 git diff --check
-~~~
+```
+
+Run slice audits when changing release-gated behavior:
+
+```powershell
+python .\scripts\dev\audits\audit_phase30_installation_docs.py
+python .\scripts\dev\audits\audit_phase29_dump_diffdump.py
+python .\scripts\dev\audits\audit_phase28_manifest_consistency.py
+```
+
+## Troubleshooting
+
+If PowerShell says `cbl` is not recognized, the package is not installed into the active environment or the environment is not active. Run:
+
+```powershell
+conda activate cbl-dev
+python -m pip install -e .
+Get-Command cbl
+cbl --help
+```
+
+If you want to run it without activation:
+
+```powershell
+conda run -n cbl-dev cbl --help
+```
+
+If CBL detects the wrong repository, pass an explicit root:
+
+```powershell
+cbl pack --repo C:\path\to\repo --issue "handoff" --budget 32000 --no-archive
+```
