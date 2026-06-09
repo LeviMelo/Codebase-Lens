@@ -7,6 +7,7 @@ Project structure for '/c/Users/Galaxy/LEVI/projects/CBL/src':
   codebase_lens/analyzers/changed_symbols.py
   codebase_lens/analyzers/cli_static.py
   codebase_lens/analyzers/contracts.py
+  codebase_lens/analyzers/docstrings.py
   codebase_lens/analyzers/evidence_graph.py
   codebase_lens/analyzers/excerpts.py
   codebase_lens/analyzers/graph_query.py
@@ -46,6 +47,8 @@ Project structure for '/c/Users/Galaxy/LEVI/projects/CBL/src':
   codebase_lens/reports/cleanup.py
   codebase_lens/reports/contract.py
   codebase_lens/reports/diff.py
+  codebase_lens/reports/diffdump.py
+  codebase_lens/reports/dump.py
   codebase_lens/reports/graph.py
   codebase_lens/reports/graph_query.py
   codebase_lens/reports/handoff.py
@@ -638,6 +641,101 @@ def flatten_cli_results(results: tuple[CliStaticAnalysisResult, ...]) -> tuple[C
 ### FILE: codebase_lens/analyzers/contracts.py
 ###############################################################################
 """Reserved module boundary for CBL. Implementation arrives in later slices."""
+
+
+
+###############################################################################
+### FILE: codebase_lens/analyzers/docstrings.py
+###############################################################################
+from __future__ import annotations
+
+import ast
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+
+from codebase_lens.core.paths import to_posix_relative
+from codebase_lens.core.textio import read_text_with_policy
+
+
+@dataclass(frozen=True)
+class ModuleDocstringRecord:
+    path: str
+    start_line: int | None
+    end_line: int | None
+    summary: str | None
+    text: str | None
+    confidence: str
+
+
+@dataclass(frozen=True)
+class ModuleDocstringResult:
+    records: tuple[ModuleDocstringRecord, ...]
+    syntax_errors: tuple[str, ...]
+    warnings: tuple[str, ...]
+
+
+def _summary(text: str | None) -> str | None:
+    if not text:
+        return None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped[:240]
+    return None
+
+
+def _module_docstring_span(tree: ast.Module) -> tuple[int | None, int | None]:
+    if not tree.body:
+        return (None, None)
+    first = tree.body[0]
+    if not isinstance(first, ast.Expr):
+        return (None, None)
+    value = first.value
+    if isinstance(value, ast.Constant) and isinstance(value.value, str):
+        start = int(getattr(first, "lineno", 1))
+        end = int(getattr(first, "end_lineno", start))
+        return (start, end)
+    return (None, None)
+
+
+def collect_module_docstring_for_file(repo_root: str | Path, file_path: str | Path) -> tuple[ModuleDocstringRecord | None, tuple[str, ...]]:
+    root = Path(repo_root).resolve()
+    target = Path(file_path).resolve()
+    relative = to_posix_relative(root, target)
+    read_result = read_text_with_policy(target)
+    if read_result.skipped_reason:
+        return None, (f"{relative}: skipped: {read_result.skipped_reason}",)
+    source = read_result.text or ""
+    try:
+        tree = ast.parse(source, filename=relative)
+    except SyntaxError as exc:
+        return None, (f"{relative}:{exc.lineno or 0}:{exc.offset or 0}: {exc.msg}",)
+    text = ast.get_docstring(tree)
+    start, end = _module_docstring_span(tree)
+    return ModuleDocstringRecord(path=relative, start_line=start, end_line=end, summary=_summary(text), text=text, confidence="high" if text else "exact_no_module_docstring"), ()
+
+
+def collect_module_docstrings(repo_root: str | Path, python_files: list[str | Path]) -> ModuleDocstringResult:
+    root = Path(repo_root).resolve()
+    records: list[ModuleDocstringRecord] = []
+    errors: list[str] = []
+    for path in sorted(str(item).replace("\\", "/") for item in python_files):
+        record, file_errors = collect_module_docstring_for_file(root, root / path)
+        errors.extend(file_errors)
+        if record is not None:
+            records.append(record)
+    return ModuleDocstringResult(records=tuple(sorted(records, key=lambda item: item.path)), syntax_errors=tuple(errors), warnings=())
+
+
+def module_docstring_payload(result: ModuleDocstringResult) -> dict[str, Any]:
+    return {
+        "schema": {"name": "cbl.module_docstrings", "version": 1},
+        "module_docstrings": [asdict(record) for record in result.records],
+        "syntax_errors": list(result.syntax_errors),
+        "warnings": list(result.warnings),
+        "counts": {"files": len(result.records), "with_docstrings": sum(1 for record in result.records if record.text), "without_docstrings": sum(1 for record in result.records if not record.text), "syntax_errors": len(result.syntax_errors)},
+    }
 
 
 
@@ -3278,7 +3376,6 @@ from codebase_lens.analyzers.tests import collect_test_inventory
 from codebase_lens.contracts.architecture import evaluate_contract, load_contract_spec
 from codebase_lens.core.constants import (
     DEFAULT_BUDGET,
-    DEFAULT_MAX_EXCERPT_BYTES,
     DEFAULT_MAX_FILE_BYTES,
     EXIT_CONTRACT_FAILURE,
     EXIT_GENERAL_ERROR,
@@ -3292,7 +3389,7 @@ from codebase_lens.core.errors import CblError, PathSafetyError, RootDetectionEr
 from codebase_lens.core.paths import detect_repository_root, display_path, gitignore_mentions_codecontext, resolve_user_path, to_posix_relative
 from codebase_lens.core.redaction import redact_console_text
 from codebase_lens.core.result import CblCommandResult, emit_result
-from codebase_lens.git.diff import collect_changed_files
+from codebase_lens.git.diff import collect_changed_files, collect_diff_between_refs, collect_diff_patch
 from codebase_lens.git.discover import collect_git_info
 from codebase_lens.reports.json import (
     caller_records_payload,
@@ -3313,6 +3410,8 @@ from codebase_lens.reports.scanner_outputs import write_file_inventory, write_tr
 from codebase_lens.scanners.universe import discover_file_universe
 from codebase_lens.reports.contract import write_contract_audit_reports
 from codebase_lens.reports.diff import write_diff_reports
+from codebase_lens.reports.diffdump import write_diffdump_reports
+from codebase_lens.reports.dump import write_codebase_dump
 
 
 def _add_global_options(parser: argparse.ArgumentParser) -> None:
@@ -3348,6 +3447,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor = sub.add_parser("doctor", parents=[parent], help="Validate local tool and repository readiness.")
     doctor.set_defaults(handler=_run_doctor)
+
+    dump = sub.add_parser("dump", parents=[parent], help="Write a search-optimized Markdown source corpus dump.")
+    dump.add_argument("--tracked-only", action="store_true", default=True, help="Include safe Git-tracked source files only. This is the default.")
+    dump.add_argument("--include-untracked", action="store_true", help="Also include safe untracked, non-ignored source files.")
+    dump.add_argument("--out-file", help="Optional repository-relative copy of the dump Markdown file.")
+    dump.add_argument("--output-format", choices=("markdown", "text"), default="markdown", help="Output syntax. Markdown is the default and recommended format.")
+    dump.add_argument("--include-json", action="store_true", help="Include selected source-adjacent JSON config files.")
+    dump.add_argument("--exclude-tests", action="store_true", help="Exclude test files from the source dump.")
+    dump.add_argument("--exclude-docs", action="store_true", help="Exclude Markdown/reStructuredText documentation files from the source dump.")
+    dump.add_argument("--exclude-config", action="store_true", help="Exclude project configuration files from the source dump.")
+    dump.add_argument("--max-total-bytes", type=int, default=0, help="Fail if included source bytes exceed this value. Zero disables the total cap.")
+    dump.add_argument("--no-line-numbers", action="store_true", help="Render raw source blocks without line-number prefixes.")
+    dump.set_defaults(handler=_run_dump)
 
     snapshot = sub.add_parser("snapshot", parents=[parent], help="Write repository snapshot reports.")
     snapshot.add_argument("--changed", action="store_true")
@@ -3396,6 +3508,14 @@ def build_parser() -> argparse.ArgumentParser:
     diff.add_argument("--symbols", action="store_true")
     diff.add_argument("--stat", action="store_true")
     diff.set_defaults(handler=_run_diff)
+
+    diffdump = sub.add_parser("diffdump", parents=[parent], help="Write a searchable full Git range diff dump.")
+    diffdump.add_argument("--from", dest="from_ref", required=True, help="Old Git ref, commit, branch, or tag.")
+    diffdump.add_argument("--to", dest="to_ref", default="HEAD", help="New Git ref, commit, branch, or tag. Defaults to HEAD.")
+    diffdump.add_argument("--symbols", action="store_true", help="Map changed hunks onto Python symbols.")
+    diffdump.add_argument("--unified", type=int, default=3, help="Unified context lines for the rendered patch.")
+    diffdump.add_argument("--out-file", help="Optional repository-relative copy of the diff dump Markdown file.")
+    diffdump.set_defaults(handler=_run_diffdump)
 
     changed = sub.add_parser("changed", parents=[parent], help="Summarize changed files and changed symbols.")
     changed.add_argument("--staged", action="store_true")
@@ -3579,6 +3699,40 @@ def _run_doctor(args: argparse.Namespace) -> int:
     return 0
 
 
+
+def _run_dump(args: argparse.Namespace) -> int:
+    try:
+        root_info = _detect_root(args)
+        repo_root = root_info.root
+        layout = prepare_output_layout(repo_root, args.out, archive=not args.no_archive)
+        result = write_codebase_dump(layout, repo_root, max_file_bytes=args.max_file_bytes, tracked_only=args.tracked_only, include_untracked=args.include_untracked, include_tests=not args.exclude_tests, include_docs=not args.exclude_docs, include_config=not args.exclude_config, include_json=args.include_json, out_file=args.out_file, output_format=args.output_format, line_numbers=not args.no_line_numbers, max_total_bytes=args.max_total_bytes)
+        outputs = {"manifest_json": ".codecontext/latest/manifest.json", **result.outputs}
+        manifest = build_manifest(**_base_manifest_args(args, repo_root, "dump", outputs, file_universe=result.file_universe, redaction=result.redaction))
+        manifest_path = write_manifest_bundle(layout, manifest)
+        copy_latest_to_run(layout)
+    except RootDetectionError as exc:
+        print(redact_console_text(f"ERROR: {exc}")); return EXIT_ROOT_DETECTION_FAILURE
+    except PathSafetyError as exc:
+        print(redact_console_text(f"ERROR: {exc}")); return EXIT_PATH_SAFETY_VIOLATION
+    except ValueError as exc:
+        print(redact_console_text(f"ERROR: {exc}")); return EXIT_INVALID_ARGUMENTS
+    except OSError as exc:
+        print(redact_console_text(f"ERROR: Could not write codebase dump: {exc}")); return EXIT_OUTPUT_WRITE_FAILURE
+    except CblError as exc:
+        print(redact_console_text(f"ERROR: {exc}")); return EXIT_GENERAL_ERROR
+    if not args.quiet:
+        print("CBL dump: OK")
+        print(f"Included source files: {result.counts.get('included_files', 0)}")
+        print(f"Python files analyzed: {result.counts.get('python_files_analyzed', 0)}")
+        print(f"Symbols indexed: {result.counts.get('symbols', 0)}")
+        print(f"Source bytes emitted: {result.counts.get('source_bytes', 0)}")
+        print("Codebase dump: .codecontext/latest/codebase_dump.md")
+        print("Dump index: .codecontext/latest/codebase_dump_index.json")
+        print(f"Output manifest: {display_path(repo_root, manifest_path, absolute=args.absolute_paths)}")
+        for warning in result.warnings:
+            print(f"WARNING: {redact_console_text(warning)}")
+    return 0
+
 def _run_tree(args: argparse.Namespace) -> int:
     try:
         root_info = _detect_root(args)
@@ -3662,7 +3816,7 @@ def _run_file(args: argparse.Namespace) -> int:
             line_selector=args.lines,
             around=args.around,
             context=args.context,
-            max_file_bytes=min(args.max_file_bytes, DEFAULT_MAX_EXCERPT_BYTES),
+            max_file_bytes=args.max_file_bytes,
         )
 
         layout = prepare_output_layout(repo_root, args.out, archive=not args.no_archive)
@@ -3858,7 +4012,7 @@ def _run_symbol(args: argparse.Namespace) -> int:
             target_path,
             line_selector=f"{start}:{end}",
             context=args.context,
-            max_file_bytes=min(args.max_file_bytes, DEFAULT_MAX_EXCERPT_BYTES),
+            max_file_bytes=args.max_file_bytes,
         )
 
         excerpt_markdown = "\n".join(
@@ -4570,6 +4724,45 @@ def _run_diff(args: argparse.Namespace) -> int:
     return 0
 
 
+
+def _run_diffdump(args: argparse.Namespace) -> int:
+    try:
+        root_info = _detect_root(args)
+        repo_root = root_info.root
+        diff_result = collect_diff_between_refs(repo_root, from_ref=args.from_ref, to_ref=args.to_ref)
+        patch_text, patch_warnings = collect_diff_patch(repo_root, from_ref=args.from_ref, to_ref=args.to_ref, unified=args.unified)
+        changed_symbols_payload = None
+        if args.symbols:
+            symbol_result = map_changed_symbols(repo_root, diff_result.changed_files)
+            changed_symbols_payload = changed_symbol_result_payload(symbol_result)
+        layout = prepare_output_layout(repo_root, args.out, archive=not args.no_archive)
+        outputs = {"manifest_json": ".codecontext/latest/manifest.json", **write_diffdump_reports(layout, repo_root, diff_result, patch_text, from_ref=args.from_ref, to_ref=args.to_ref, unified=args.unified, changed_symbols_payload=changed_symbols_payload, patch_warnings=patch_warnings, out_file=args.out_file)}
+        manifest = build_manifest(**_base_manifest_args(args, repo_root, "diffdump", outputs))
+        manifest_path = write_manifest_bundle(layout, manifest)
+        copy_latest_to_run(layout)
+    except RootDetectionError as exc:
+        print(redact_console_text(f"ERROR: {exc}")); return EXIT_ROOT_DETECTION_FAILURE
+    except PathSafetyError as exc:
+        print(redact_console_text(f"ERROR: {exc}")); return EXIT_PATH_SAFETY_VIOLATION
+    except ValueError as exc:
+        print(redact_console_text(f"ERROR: {exc}")); return EXIT_INVALID_ARGUMENTS
+    except OSError as exc:
+        print(redact_console_text(f"ERROR: Could not write diff dump: {exc}")); return EXIT_OUTPUT_WRITE_FAILURE
+    except CblError as exc:
+        print(redact_console_text(f"ERROR: {exc}")); return EXIT_GENERAL_ERROR
+    if not args.quiet:
+        print("CBL diffdump: OK")
+        print(f"From: {args.from_ref}")
+        print(f"To: {args.to_ref}")
+        print(f"Changed files: {diff_result.counts.get('changed_files_count', 0)}")
+        print(f"Hunks: {diff_result.counts.get('hunk_count', 0)}")
+        print("Diff dump: .codecontext/latest/diff_dump.md")
+        print("Diff dump index: .codecontext/latest/diff_dump_index.json")
+        print(f"Output manifest: {display_path(repo_root, manifest_path, absolute=args.absolute_paths)}")
+        for warning in [*diff_result.warnings, *patch_warnings]:
+            print(f"WARNING: {redact_console_text(warning)}")
+    return 0
+
 def _run_changed(args: argparse.Namespace) -> int:
     try:
         root_info = _detect_root(args)
@@ -4840,6 +5033,13 @@ def builtin_cbl_contract() -> dict[str, Any]:
             "scripts/dev/audits/audit_phase26_v01_release_closure.py",
             "scripts/dev/audits/audit_phase27_reliability_corrections.py",
             "scripts/dev/audits/audit_phase28_manifest_consistency.py",
+            "scripts/dev/audits/audit_phase29_dump_diffdump.py",
+            "tests/test_installation_docs.py",
+            "scripts/dev/audits/audit_phase30_installation_docs.py",
+            "docs/INSTALLATION.md",
+            "src/codebase_lens/reports/diffdump.py",
+            "src/codebase_lens/reports/dump.py",
+            "src/codebase_lens/analyzers/docstrings.py",
 ],
         "required_symbols": [
             {
@@ -4852,6 +5052,8 @@ def builtin_cbl_contract() -> dict[str, Any]:
                     "_run_pack",
                     "_run_clean",
                     "_run_graph",
+                    "_run_diffdump",
+                    "_run_dump",
                     "_run_tree",
                     "_run_file",
                     "_run_symbols",
@@ -5003,6 +5205,37 @@ def builtin_cbl_contract() -> dict[str, Any]:
                     "ManifestConsistencyIssue",
                     "ManifestConsistencyResult",
                     "run_manifest_consistency_audit",
+                    "main",
+                ],
+            },
+
+            {
+                "path": "src/codebase_lens/analyzers/docstrings.py",
+                "symbols": ["ModuleDocstringRecord", "ModuleDocstringResult", "collect_module_docstrings", "module_docstring_payload"],
+            },
+            {
+                "path": "src/codebase_lens/reports/dump.py",
+                "symbols": ["DumpBundleResult", "write_codebase_dump"],
+            },
+            {
+                "path": "src/codebase_lens/reports/diffdump.py",
+                "symbols": ["render_diff_dump_markdown", "write_diffdump_reports"],
+            },
+            {
+                "path": "src/codebase_lens/git/diff.py",
+                "symbols": ["collect_diff_between_refs", "collect_diff_patch"],
+            },
+            {
+                "path": "scripts/dev/audits/audit_phase29_dump_diffdump.py",
+                "symbols": ["DumpDiffdumpIssue", "DumpDiffdumpResult", "run_dump_diffdump_audit", "main"],
+            },
+
+            {
+                "path": "scripts/dev/audits/audit_phase30_installation_docs.py",
+                "symbols": [
+                    "InstallationDocsIssue",
+                    "InstallationDocsAuditResult",
+                    "run_installation_docs_audit",
                     "main",
                 ],
             },
@@ -7525,6 +7758,7 @@ PARTIAL_IMPLEMENTATION_MESSAGE = (
 
 PUBLIC_COMMANDS = (
     "doctor",
+    "dump",
     "snapshot",
     "tree",
     "symbols",
@@ -7533,6 +7767,7 @@ PUBLIC_COMMANDS = (
     "routes",
     "tests",
     "diff",
+    "diffdump",
     "changed",
     "file",
     "symbol",
@@ -8865,6 +9100,48 @@ def collect_changed_files(
     )
 
 
+def collect_diff_between_refs(
+    repo_root: str | Path,
+    *,
+    from_ref: str,
+    to_ref: str = "HEAD",
+) -> ChangedFileSet:
+    """Return changed-file records for an explicit Git ref range."""
+
+    root = Path(repo_root).resolve()
+    if not _is_git_repo(root):
+        return ChangedFileSet(repo_root=root, changed_files=(), counts=_counts(()), warnings=("Git range diff analysis requires a Git work tree.",))
+    if not from_ref.strip():
+        return ChangedFileSet(repo_root=root, changed_files=(), counts=_counts(()), warnings=("Git range diff requires a non-empty from_ref.",))
+    to_ref = to_ref.strip() or "HEAD"
+    files = _collect_diff_origin(root, origin=f"range:{from_ref}..{to_ref}", diff_prefix=["diff", from_ref, to_ref])
+    changed = _merge_changed_files(files)
+    return ChangedFileSet(repo_root=root, changed_files=changed, counts=_counts(changed), warnings=())
+
+
+def collect_diff_patch(
+    repo_root: str | Path,
+    *,
+    from_ref: str,
+    to_ref: str = "HEAD",
+    unified: int = 3,
+) -> tuple[str, tuple[str, ...]]:
+    """Return raw ``git diff`` patch text for an explicit ref range."""
+
+    root = Path(repo_root).resolve()
+    to_ref = to_ref.strip() or "HEAD"
+    unified = max(0, int(unified))
+    if not _is_git_repo(root):
+        return "", ("Git range diff patch requires a Git work tree.",)
+    result = _run_git(root, ["diff", f"--unified={unified}", "--find-renames", from_ref, to_ref, "--"])
+    if result is None:
+        return "", ("Git executable is unavailable.",)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "git diff failed").strip()
+        return "", (detail,)
+    return result.stdout, ()
+
+
 
 ###############################################################################
 ### FILE: codebase_lens/git/discover.py
@@ -9588,6 +9865,327 @@ def write_diff_reports(
         "diff_json": ".codecontext/latest/diff.json",
         "diff_summary_md": ".codecontext/latest/diff_summary.md",
     }
+
+
+
+###############################################################################
+### FILE: codebase_lens/reports/diffdump.py
+###############################################################################
+from __future__ import annotations
+
+import hashlib
+from dataclasses import asdict
+from pathlib import Path
+from typing import Any
+
+from codebase_lens.core.paths import resolve_user_path, to_posix_relative
+from codebase_lens.core.redaction import redact_text
+from codebase_lens.reports.json import changed_files_payload, write_json_report
+from codebase_lens.reports.manifest import OutputLayout
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _file_line(record: object) -> str:
+    path = str(getattr(record, "path", ""))
+    status = str(getattr(record, "status", ""))
+    additions = getattr(record, "additions", None)
+    deletions = getattr(record, "deletions", None)
+    hunks = getattr(record, "hunks", ()) or ()
+    old_path = getattr(record, "old_path", None)
+    rename = f"; old path `{old_path}`" if old_path else ""
+    return f"- `{path}` — status `{status}`; +{additions if additions is not None else '?'} -{deletions if deletions is not None else '?'}; hunks={len(hunks)}{rename}"
+
+
+def _changed_symbol_lines(changed_symbols_payload: dict[str, Any] | None) -> list[str]:
+    if not changed_symbols_payload:
+        return ["- Changed-symbol mapping was not requested. Re-run with `--symbols`."]
+    records = changed_symbols_payload.get("changed_symbols", [])
+    if not isinstance(records, list) or not records:
+        return ["- No changed Python symbols were identified."]
+    lines: list[str] = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        path = record.get("path", "")
+        name = record.get("qualified_name") or record.get("name") or "<unknown>"
+        start = record.get("start_line", "?")
+        end = record.get("end_line", start)
+        lines.append(f"- `{name}` — `{path}:L{start}-L{end}`")
+    return lines
+
+
+def render_diff_dump_markdown(diff_result: object, patch_text: str, *, from_ref: str, to_ref: str, unified: int, changed_symbols_payload: dict[str, Any] | None = None, patch_warnings: tuple[str, ...] = ()) -> tuple[str, dict[str, Any]]:
+    files = tuple(getattr(diff_result, "changed_files", ()) or ())
+    counts = dict(getattr(diff_result, "counts", {}) or {})
+    warnings = [*list(getattr(diff_result, "warnings", ()) or ()), *list(patch_warnings)]
+    redacted_patch = redact_text(patch_text)
+    lines: list[str] = ["# CBL Diff Dump", "", f"From: `{from_ref}`", f"To: `{to_ref}`", f"Unified context lines: {unified}", "Patch truncation: `disabled`", "Safety: redaction enabled", "", "## Counts", ""]
+    for key in sorted(counts):
+        lines.append(f"- {key}: {counts[key]}")
+    lines.extend(["", "## Changed Files", ""])
+    lines.extend(_file_line(item) for item in files) if files else lines.append("- No changed files detected in this Git range.")
+    lines.extend(["", "## Changed Symbols", ""])
+    lines.extend(_changed_symbol_lines(changed_symbols_payload))
+    if warnings:
+        lines.extend(["", "## Warnings", ""])
+        lines.extend(f"- {item}" for item in warnings)
+    lines.extend(["", "## Full Patch", "", "~~~~diff", redacted_patch.text.rstrip("\n") if redacted_patch.text else "<empty diff>", "~~~~", ""])
+    index = {"schema": {"name": "cbl.diff_dump", "version": 1}, "from_ref": from_ref, "to_ref": to_ref, "unified": unified, "patch_sha256": _sha256_text(redacted_patch.text), "patch_bytes": len(redacted_patch.text.encode("utf-8")), "changed_files": [asdict(item) for item in files], "changed_symbols": changed_symbols_payload, "counts": counts, "warnings": warnings, "redaction": {"enabled": True, "redacted_occurrences_count": redacted_patch.stats.redacted_occurrences_count, "patterns_hit": list(redacted_patch.stats.patterns_hit)}}
+    return "\n".join(lines).rstrip() + "\n", index
+
+
+def write_diffdump_reports(layout: OutputLayout, repo_root: str | Path, diff_result: object, patch_text: str, *, from_ref: str, to_ref: str, unified: int, changed_symbols_payload: dict[str, Any] | None = None, patch_warnings: tuple[str, ...] = (), out_file: str | None = None) -> dict[str, str]:
+    root = Path(repo_root).resolve()
+    markdown, index = render_diff_dump_markdown(diff_result, patch_text, from_ref=from_ref, to_ref=to_ref, unified=unified, changed_symbols_payload=changed_symbols_payload, patch_warnings=patch_warnings)
+    (layout.latest_dir / "diff_dump.md").write_text(markdown, encoding="utf-8", newline="\n")
+    write_json_report(layout.latest_dir / "diff_dump_index.json", index)
+    write_json_report(layout.latest_dir / "diff.json", changed_files_payload(diff_result))
+    outputs = {"diff_dump_md": ".codecontext/latest/diff_dump.md", "diff_dump_index_json": ".codecontext/latest/diff_dump_index.json", "diff_json": ".codecontext/latest/diff.json"}
+    if out_file:
+        target = resolve_user_path(root, out_file, allow_absolute=False, allow_hard_excluded=False)
+        rel = to_posix_relative(root, target)
+        if Path(rel).name in {"codebase_dump.md", "codebase_dump.txt"}:
+            raise ValueError("--out-file for diffdump may not target a codebase dump artifact name.")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(markdown, encoding="utf-8", newline="\n")
+        outputs["diff_dump_copy"] = rel
+    return outputs
+
+
+
+###############################################################################
+### FILE: codebase_lens/reports/dump.py
+###############################################################################
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+
+from codebase_lens.analyzers.docstrings import collect_module_docstrings, module_docstring_payload
+from codebase_lens.analyzers.python_ast import collect_python_symbols, flatten_symbol_results
+from codebase_lens.core.hashing import sha256_file
+from codebase_lens.core.paths import resolve_user_path, to_posix_relative
+from codebase_lens.core.redaction import redact_text
+from codebase_lens.core.textio import read_text_with_policy
+from codebase_lens.reports.json import symbol_records_payload, write_json_report
+from codebase_lens.reports.manifest import OutputLayout
+from codebase_lens.scanners.universe import discover_file_universe
+
+
+SOURCE_EXTENSIONS = frozenset({".py", ".pyi", ".pyw", ".toml", ".yaml", ".yml", ".ini", ".cfg", ".md", ".rst", ".ps1", ".psm1", ".bat", ".cmd", ".sh", ".js", ".jsx", ".ts", ".tsx", ".css", ".scss", ".html"})
+CONFIG_FILENAMES = frozenset({"pyproject.toml", "setup.cfg", "tox.ini", "pytest.ini", "mypy.ini", "ruff.toml", ".gitignore", ".dockerignore", "requirements.txt", "requirements-dev.txt", "setup.py", "package.json", "tsconfig.json", "jsconfig.json", "biome.json", ".eslintrc.json", ".prettierrc.json"})
+JSON_CONFIG_FILENAMES = frozenset({"package.json", "tsconfig.json", "jsconfig.json", "biome.json", ".eslintrc.json", ".prettierrc.json"})
+DUMP_ARTIFACT_NAMES = frozenset({"codebase_dump.md", "codebase_dump.txt", "codebase_dump_index.json", "diff_dump.md", "diff_dump.txt", "diff_dump_index.json"})
+
+
+@dataclass(frozen=True)
+class DumpBundleResult:
+    outputs: dict[str, str]
+    counts: dict[str, int]
+    warnings: tuple[str, ...]
+    file_universe: dict[str, Any]
+    redaction: dict[str, Any]
+
+
+def _is_test_path(path: str) -> bool:
+    normalized = path.replace("\\", "/")
+    return normalized.startswith("tests/") or "/tests/" in f"/{normalized}/" or Path(normalized).name.startswith("test_")
+
+
+def _is_doc_path(path: str) -> bool:
+    return Path(path).suffix.lower() in {".md", ".rst"}
+
+
+def _is_config_path(path: str) -> bool:
+    p = Path(path)
+    return p.name in CONFIG_FILENAMES or p.suffix.lower() in {".toml", ".yaml", ".yml", ".ini", ".cfg"}
+
+
+def _is_dump_artifact(path: str) -> bool:
+    name = Path(path).name.lower()
+    normalized = path.replace("\\", "/").lower()
+    return name in DUMP_ARTIFACT_NAMES or "codebase_dump" in name or "cbl_dump" in name or normalized.startswith(".codecontext/")
+
+
+def _source_like(path: str, *, include_json: bool) -> bool:
+    p = Path(path)
+    suffix = p.suffix.lower()
+    name = p.name
+    if name in CONFIG_FILENAMES:
+        return include_json or suffix != ".json" or name in JSON_CONFIG_FILENAMES
+    if suffix == ".json":
+        return bool(include_json and name in JSON_CONFIG_FILENAMES)
+    return suffix in SOURCE_EXTENSIONS
+
+
+def _language(path: str) -> str:
+    suffix = Path(path).suffix.lower().strip(".")
+    if suffix in {"py", "pyi", "pyw"}:
+        return "python"
+    if suffix in {"md", "rst"}:
+        return suffix
+    return suffix or "text"
+
+
+def _tree(paths: list[str]) -> str:
+    rendered: list[str] = []
+    seen: set[str] = set()
+    for path in sorted(paths):
+        parts = path.split("/")
+        for index, part in enumerate(parts):
+            marker_path = "/".join(parts[: index + 1])
+            if marker_path in seen:
+                continue
+            seen.add(marker_path)
+            prefix = "  " * index
+            marker = "└─ " if index == len(parts) - 1 else "├─ "
+            rendered.append(f"{prefix}{marker}{part}")
+    return "\n".join(rendered)
+
+
+def _numbered(text: str) -> str:
+    lines = text.splitlines()
+    if not lines:
+        return "0001: "
+    width = max(4, len(str(len(lines))))
+    return "\n".join(f"{index:0{width}d}: {line}" for index, line in enumerate(lines, start=1))
+
+
+def _filter_records(records: tuple[Any, ...], *, tracked_only: bool, include_untracked: bool, include_tests: bool, include_docs: bool, include_config: bool, include_json: bool) -> tuple[list[Any], list[dict[str, Any]]]:
+    selected: list[Any] = []
+    omitted: list[dict[str, Any]] = []
+    for record in records:
+        path = str(getattr(record, "path", ""))
+        git_status = str(getattr(record, "git_status", "") or "")
+        reason: str | None = None
+        if _is_dump_artifact(path):
+            reason = "generated_dump_artifact"
+        elif tracked_only and git_status == "untracked" and not include_untracked:
+            reason = "untracked_not_requested"
+        elif not include_tests and _is_test_path(path):
+            reason = "tests_excluded"
+        elif not include_docs and _is_doc_path(path):
+            reason = "docs_excluded"
+        elif not include_config and _is_config_path(path):
+            reason = "config_excluded"
+        elif not _source_like(path, include_json=include_json):
+            reason = "not_source_like_for_dump"
+        if reason:
+            omitted.append({"path": path, "reason": reason, "size_bytes": getattr(record, "size_bytes", None), "category": "dump_filter"})
+        else:
+            selected.append(record)
+    return selected, sorted(omitted, key=lambda item: str(item.get("path")))
+
+
+def _render_symbol_index(symbols: tuple[Any, ...]) -> list[str]:
+    lines: list[str] = []
+    by_path: dict[str, list[Any]] = {}
+    for symbol in symbols:
+        by_path.setdefault(symbol.path, []).append(symbol)
+    for path in sorted(by_path):
+        lines.extend([f"### `{path}`", ""])
+        for symbol in sorted(by_path[path], key=lambda item: (item.start_line, item.qualified_name)):
+            evidence = f"{symbol.path}:L{symbol.start_line}-L{symbol.end_line}"
+            lines.append(f"- SYMBOL: `{symbol.qualified_name}` — `{symbol.kind}` — `{evidence}`")
+            if symbol.signature:
+                lines.append(f"  - Signature: `{symbol.signature}`")
+            if symbol.docstring_summary:
+                lines.append(f"  - Docstring: {symbol.docstring_summary}")
+        lines.append("")
+    return lines or ["No Python symbols were detected.", ""]
+
+
+def _render_docstring_index(module_payload: dict[str, Any]) -> list[str]:
+    records = module_payload.get("module_docstrings", [])
+    lines: list[str] = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        summary = record.get("summary")
+        path = record.get("path")
+        if not path or not summary:
+            continue
+        start = record.get("start_line") or "?"
+        end = record.get("end_line") or start
+        lines.extend([f"### `{path}`", "", f"- Evidence: `{path}:L{start}-L{end}`", f"- Summary: {summary}", ""])
+    return lines or ["No module docstrings were detected.", ""]
+
+
+def _render_source_file(repo_root: Path, path: str, *, line_numbers: bool, max_file_bytes: int) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    target = repo_root / path
+    read_result = read_text_with_policy(target, max_file_bytes=max_file_bytes)
+    if read_result.skipped_reason:
+        raise ValueError(f"Selected dump file was unexpectedly skipped: {path}: {read_result.skipped_reason}")
+    raw = read_result.text or ""
+    redacted = redact_text(raw)
+    body = _numbered(redacted.text) if line_numbers else redacted.text.rstrip("\n")
+    language = _language(path)
+    rendered = "\n".join([f"### FILE: `{path}`", "", f"Language: `{language}`", f"Lines: {len(raw.splitlines())}", f"SHA256: `{sha256_file(target)}`", "", f"~~~~{language}", body, "~~~~", ""])
+    file_payload = {"path": path, "language": language, "size_bytes": read_result.size_bytes, "line_count": len(raw.splitlines()), "sha256": sha256_file(target), "redacted": bool(redacted.stats.redacted_occurrences_count)}
+    redaction_payload = {"occurrences": redacted.stats.redacted_occurrences_count, "patterns_hit": list(redacted.stats.patterns_hit)}
+    return rendered, file_payload, redaction_payload
+
+
+def write_codebase_dump(layout: OutputLayout, repo_root: str | Path, *, max_file_bytes: int, tracked_only: bool = True, include_untracked: bool = False, include_tests: bool = True, include_docs: bool = True, include_config: bool = True, include_json: bool = False, out_file: str | None = None, output_format: str = "markdown", line_numbers: bool = True, max_total_bytes: int = 0) -> DumpBundleResult:
+    root = Path(repo_root).resolve()
+    universe = discover_file_universe(root, max_file_bytes=max_file_bytes)
+    selected, dump_omissions = _filter_records(universe.included_files, tracked_only=tracked_only, include_untracked=include_untracked, include_tests=include_tests, include_docs=include_docs, include_config=include_config, include_json=include_json)
+    selected_paths = [record.path for record in selected]
+    source_bytes = sum(int(getattr(record, "size_bytes", 0) or 0) for record in selected)
+    if max_total_bytes and source_bytes > max_total_bytes:
+        raise ValueError(f"Dump would emit {source_bytes} source bytes, exceeding --max-total-bytes={max_total_bytes}. Narrow selection or raise the cap.")
+    python_files = [path for path in selected_paths if Path(path).suffix.lower() in {".py", ".pyw", ".pyi"}]
+    symbol_results = collect_python_symbols(root, python_files)
+    symbols = flatten_symbol_results(symbol_results)
+    symbol_payload = symbol_records_payload(symbols, syntax_errors=[])
+    module_docstrings = collect_module_docstrings(root, python_files)
+    module_payload = module_docstring_payload(module_docstrings)
+    lines: list[str] = ["# CBL Codebase Dump", "", f"Repository: `{root.name}`", f"Format: `{output_format}`", f"Tracked only: `{str(tracked_only).lower()}`", f"Include untracked: `{str(include_untracked).lower()}`", f"Line numbers: `{str(line_numbers).lower()}`", "Source truncation: `disabled for included files`", "Safety: hard exclusions and redaction enabled", "", "## Counts", "", f"- Included source files: {len(selected_paths)}", f"- Python files analyzed: {len(python_files)}", f"- Symbols indexed: {len(symbols)}", f"- Source bytes emitted: {source_bytes}", f"- Dump-filter omissions: {len(dump_omissions)}", f"- Scanner omissions: {len(universe.omitted_files)}", "", "## File Tree", "", "~~~~text", _tree(selected_paths) or "<empty>", "~~~~", "", "## Module Docstring Index", "", *_render_docstring_index(module_payload), "## Symbol Index", "", *_render_symbol_index(symbols), "## Omitted Files", ""]
+    all_omissions: list[dict[str, Any]] = [*dump_omissions]
+    for item in universe.omitted_files:
+        all_omissions.append(asdict(item))
+    if all_omissions:
+        lines.extend(["| Path | Reason | Category | Size |", "|---|---|---:|---:|"])
+        for item in sorted(all_omissions, key=lambda value: str(value.get("path"))):
+            lines.append(f"| `{item.get('path', '')}` | `{item.get('reason', '')}` | `{item.get('category', '')}` | {item.get('size_bytes', '') or ''} |")
+    else:
+        lines.append("No files were omitted.")
+    lines.extend(["", "## Source Files", ""])
+    files_payload: list[dict[str, Any]] = []
+    redacted_files = 0
+    redacted_occurrences = 0
+    patterns_hit: set[str] = set()
+    warnings: list[str] = list(universe.warnings)
+    for path in selected_paths:
+        rendered, file_payload, redaction_payload = _render_source_file(root, path, line_numbers=line_numbers, max_file_bytes=max_file_bytes)
+        lines.append(rendered.rstrip("\n"))
+        lines.append("")
+        files_payload.append(file_payload)
+        occurrences = int(redaction_payload.get("occurrences", 0) or 0)
+        if occurrences:
+            redacted_files += 1
+            redacted_occurrences += occurrences
+            patterns_hit.update(str(item) for item in redaction_payload.get("patterns_hit", []))
+    dump_text = "\n".join(lines).rstrip() + "\n"
+    dump_name = "codebase_dump.md" if output_format == "markdown" else "codebase_dump.txt"
+    (layout.latest_dir / dump_name).write_text(dump_text, encoding="utf-8", newline="\n")
+    index_payload = {"schema": {"name": "cbl.codebase_dump", "version": 1}, "mode": "tracked_source_dump", "line_numbers": line_numbers, "source_truncation": "disabled_for_included_files", "files": files_payload, "module_docstrings": module_payload, "symbols": symbol_payload, "omitted_files": all_omissions, "counts": {"included_files": len(selected_paths), "python_files_analyzed": len(python_files), "symbols": len(symbols), "source_bytes": source_bytes, "dump_filter_omissions": len(dump_omissions), "scanner_omissions": len(universe.omitted_files)}, "warnings": warnings}
+    write_json_report(layout.latest_dir / "codebase_dump_index.json", index_payload)
+    outputs = {"codebase_dump_md": f".codecontext/latest/{dump_name}", "codebase_dump_index_json": ".codecontext/latest/codebase_dump_index.json"}
+    if out_file:
+        target = resolve_user_path(root, out_file, allow_absolute=False, allow_hard_excluded=False)
+        rel = to_posix_relative(root, target)
+        if _is_dump_artifact(rel):
+            raise ValueError("--out-file may not target an existing or recursive dump artifact name.")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(dump_text, encoding="utf-8", newline="\n")
+        outputs["codebase_dump_copy"] = rel
+    redaction = {"enabled": True, "redacted_files_count": redacted_files + universe.counts.get("redacted_file_count", 0), "redacted_occurrences_count": redacted_occurrences + universe.redaction.redacted_occurrences_count, "patterns_hit": sorted(set(patterns_hit) | set(universe.redaction.patterns_hit))}
+    return DumpBundleResult(outputs=outputs, counts=dict(index_payload["counts"]), warnings=tuple(warnings), file_universe=universe.manifest_counts(), redaction=redaction)
 
 
 
