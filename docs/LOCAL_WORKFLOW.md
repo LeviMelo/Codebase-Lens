@@ -76,3 +76,6 @@ python -m codebase_lens pack --issue "prepare AI handoff" --budget 32000 --no-ar
 ~~~
 
 Run these commands from the target repository root, or pass `--repo` explicitly. Do not run repo-local validation commands from a parent workspace unless that is intentional.
+## CBL dump scoping
+
+`cbl dump --no-archive` intentionally dumps from the detected repository root. Changing the shell directory into `src` does not narrow the dump. Use `cbl dump --path src --no-archive` to dump only `src/`. Use `cbl dump --cwd-scope --no-archive` when the current working directory should define the dump scope. Scope paths are filters over the safe file universe; they do not bypass hard exclusions, redaction, or `.codecontext/` exclusion.

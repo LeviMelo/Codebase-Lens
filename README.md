@@ -286,3 +286,6 @@ cbl pack --issue "prepare AI handoff" --budget 32000 --no-archive
 Release gates must be run from the CBL repository root. They include the command-surface audit, fixture-matrix audit, release-safety audit, documentation-workflow audit, report-contract parity audit, release-closure audit, reliability-corrections audit, manifest-consistency audit, dump/diffdump audit, installation-docs audit, the built-in architecture contract, the pytest suite, and `git diff --check`.
 
 The release gates protect the local-only model, static-analysis-only behavior, `.codecontext/` recursion exclusion, report contract parity, public command stability, and AI-facing documentation compatibility.
+## CBL dump scoping
+
+`cbl dump --no-archive` intentionally dumps from the detected repository root. Changing the shell directory into `src` does not narrow the dump. Use `cbl dump --path src --no-archive` to dump only `src/`. Use `cbl dump --cwd-scope --no-archive` when the current working directory should define the dump scope. Scope paths are filters over the safe file universe; they do not bypass hard exclusions, redaction, or `.codecontext/` exclusion.
