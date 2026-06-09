@@ -27,7 +27,6 @@ from codebase_lens.analyzers.tests import collect_test_inventory
 from codebase_lens.contracts.architecture import evaluate_contract, load_contract_spec
 from codebase_lens.core.constants import (
     DEFAULT_BUDGET,
-    DEFAULT_MAX_EXCERPT_BYTES,
     DEFAULT_MAX_FILE_BYTES,
     EXIT_CONTRACT_FAILURE,
     EXIT_GENERAL_ERROR,
@@ -468,7 +467,7 @@ def _run_file(args: argparse.Namespace) -> int:
             line_selector=args.lines,
             around=args.around,
             context=args.context,
-            max_file_bytes=min(args.max_file_bytes, DEFAULT_MAX_EXCERPT_BYTES),
+            max_file_bytes=args.max_file_bytes,
         )
 
         layout = prepare_output_layout(repo_root, args.out, archive=not args.no_archive)
@@ -664,7 +663,7 @@ def _run_symbol(args: argparse.Namespace) -> int:
             target_path,
             line_selector=f"{start}:{end}",
             context=args.context,
-            max_file_bytes=min(args.max_file_bytes, DEFAULT_MAX_EXCERPT_BYTES),
+            max_file_bytes=args.max_file_bytes,
         )
 
         excerpt_markdown = "\n".join(
