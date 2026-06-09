@@ -94,6 +94,43 @@ def _numbered(text: str) -> str:
     return "\n".join(f"{index:0{width}d}: {line}" for index, line in enumerate(lines, start=1))
 
 
+def _normalize_scope_paths(repo_root: Path, raw_scope_paths: tuple[str, ...] | list[str] | None) -> tuple[str, ...]:
+    """Normalize repo-relative dump scope paths.
+
+    Scope paths are explicit filters over the already-safe file universe. They do
+    not redefine the repository root and they do not bypass hard exclusions.
+    """
+
+    if not raw_scope_paths:
+        return ()
+
+    values: list[str] = []
+    for raw in raw_scope_paths:
+        text = str(raw).strip()
+        if not text:
+            continue
+        target = resolve_user_path(repo_root, text, allow_absolute=False, allow_hard_excluded=False)
+        if not target.exists():
+            raise ValueError(f"Dump scope does not exist: {text}")
+        relative = to_posix_relative(repo_root, target).strip("/").replace("\\", "/")
+        if relative in {"", "."}:
+            continue
+        if relative not in values:
+            values.append(relative)
+
+    return tuple(values)
+
+
+def _record_in_scope(path: str, scope_paths: tuple[str, ...]) -> bool:
+    if not scope_paths:
+        return True
+    normalized = path.replace("\\", "/").strip("/")
+    for scope in scope_paths:
+        if normalized == scope or normalized.startswith(scope.rstrip("/") + "/"):
+            return True
+    return False
+
+
 def _filter_records(records: tuple[Any, ...], *, tracked_only: bool, include_untracked: bool, include_tests: bool, include_docs: bool, include_config: bool, include_json: bool) -> tuple[list[Any], list[dict[str, Any]]]:
     selected: list[Any] = []
     omitted: list[dict[str, Any]] = []
@@ -169,11 +206,22 @@ def _render_source_file(repo_root: Path, path: str, *, line_numbers: bool, max_f
     return rendered, file_payload, redaction_payload
 
 
-def write_codebase_dump(layout: OutputLayout, repo_root: str | Path, *, max_file_bytes: int, tracked_only: bool = True, include_untracked: bool = False, include_tests: bool = True, include_docs: bool = True, include_config: bool = True, include_json: bool = False, out_file: str | None = None, output_format: str = "markdown", line_numbers: bool = True, max_total_bytes: int = 0) -> DumpBundleResult:
+def write_codebase_dump(layout: OutputLayout, repo_root: str | Path, *, max_file_bytes: int, tracked_only: bool = True, include_untracked: bool = False, include_tests: bool = True, include_docs: bool = True, include_config: bool = True, include_json: bool = False, out_file: str | None = None, output_format: str = "markdown", line_numbers: bool = True, max_total_bytes: int = 0, scope_paths: tuple[str, ...] | list[str] | None = None) -> DumpBundleResult:
     root = Path(repo_root).resolve()
     universe = discover_file_universe(root, max_file_bytes=max_file_bytes)
-    selected, dump_omissions = _filter_records(universe.included_files, tracked_only=tracked_only, include_untracked=include_untracked, include_tests=include_tests, include_docs=include_docs, include_config=include_config, include_json=include_json)
+    normalized_scope_paths = _normalize_scope_paths(root, scope_paths)
+    scoped_records = tuple(
+        record
+        for record in universe.included_files
+        if _record_in_scope(str(getattr(record, "path", "")), normalized_scope_paths)
+    )
+    if normalized_scope_paths and not scoped_records:
+        raise ValueError(f"Dump scope selected no scan-eligible files: {', '.join(normalized_scope_paths)}")
+
+    selected, dump_omissions = _filter_records(scoped_records, tracked_only=tracked_only, include_untracked=include_untracked, include_tests=include_tests, include_docs=include_docs, include_config=include_config, include_json=include_json)
     selected_paths = [record.path for record in selected]
+    if normalized_scope_paths and not selected_paths:
+        raise ValueError(f"Dump scope selected no source-like files after filters: {', '.join(normalized_scope_paths)}")
     source_bytes = sum(int(getattr(record, "size_bytes", 0) or 0) for record in selected)
     if max_total_bytes and source_bytes > max_total_bytes:
         raise ValueError(f"Dump would emit {source_bytes} source bytes, exceeding --max-total-bytes={max_total_bytes}. Narrow selection or raise the cap.")
@@ -183,7 +231,8 @@ def write_codebase_dump(layout: OutputLayout, repo_root: str | Path, *, max_file
     symbol_payload = symbol_records_payload(symbols, syntax_errors=[])
     module_docstrings = collect_module_docstrings(root, python_files)
     module_payload = module_docstring_payload(module_docstrings)
-    lines: list[str] = ["# CBL Codebase Dump", "", f"Repository: `{root.name}`", f"Format: `{output_format}`", f"Tracked only: `{str(tracked_only).lower()}`", f"Include untracked: `{str(include_untracked).lower()}`", f"Line numbers: `{str(line_numbers).lower()}`", "Source truncation: `disabled for included files`", "Safety: hard exclusions and redaction enabled", "", "## Counts", "", f"- Included source files: {len(selected_paths)}", f"- Python files analyzed: {len(python_files)}", f"- Symbols indexed: {len(symbols)}", f"- Source bytes emitted: {source_bytes}", f"- Dump-filter omissions: {len(dump_omissions)}", f"- Scanner omissions: {len(universe.omitted_files)}", "", "## File Tree", "", "~~~~text", _tree(selected_paths) or "<empty>", "~~~~", "", "## Module Docstring Index", "", *_render_docstring_index(module_payload), "## Symbol Index", "", *_render_symbol_index(symbols), "## Omitted Files", ""]
+    scope_label = ", ".join(normalized_scope_paths) if normalized_scope_paths else "<repository>"
+    lines: list[str] = ["# CBL Codebase Dump", "", f"Repository: `{root.name}`", f"Scope: `{scope_label}`", f"Format: `{output_format}`", f"Tracked only: `{str(tracked_only).lower()}`", f"Include untracked: `{str(include_untracked).lower()}`", f"Line numbers: `{str(line_numbers).lower()}`", "Source truncation: `disabled for included files`", "Safety: hard exclusions and redaction enabled", "", "## Counts", "", f"- Included source files: {len(selected_paths)}", f"- Python files analyzed: {len(python_files)}", f"- Symbols indexed: {len(symbols)}", f"- Source bytes emitted: {source_bytes}", f"- Dump-filter omissions: {len(dump_omissions)}", f"- Scanner omissions: {len(universe.omitted_files)}", "", "## File Tree", "", "~~~~text", _tree(selected_paths) or "<empty>", "~~~~", "", "## Module Docstring Index", "", *_render_docstring_index(module_payload), "## Symbol Index", "", *_render_symbol_index(symbols), "## Omitted Files", ""]
     all_omissions: list[dict[str, Any]] = [*dump_omissions]
     for item in universe.omitted_files:
         all_omissions.append(asdict(item))
@@ -212,7 +261,7 @@ def write_codebase_dump(layout: OutputLayout, repo_root: str | Path, *, max_file
     dump_text = "\n".join(lines).rstrip() + "\n"
     dump_name = "codebase_dump.md" if output_format == "markdown" else "codebase_dump.txt"
     (layout.latest_dir / dump_name).write_text(dump_text, encoding="utf-8", newline="\n")
-    index_payload = {"schema": {"name": "cbl.codebase_dump", "version": 1}, "mode": "tracked_source_dump", "line_numbers": line_numbers, "source_truncation": "disabled_for_included_files", "files": files_payload, "module_docstrings": module_payload, "symbols": symbol_payload, "omitted_files": all_omissions, "counts": {"included_files": len(selected_paths), "python_files_analyzed": len(python_files), "symbols": len(symbols), "source_bytes": source_bytes, "dump_filter_omissions": len(dump_omissions), "scanner_omissions": len(universe.omitted_files)}, "warnings": warnings}
+    index_payload = {"schema": {"name": "cbl.codebase_dump", "version": 2}, "mode": "tracked_source_dump", "scope_paths": list(normalized_scope_paths), "line_numbers": line_numbers, "source_truncation": "disabled_for_included_files", "files": files_payload, "module_docstrings": module_payload, "symbols": symbol_payload, "omitted_files": all_omissions, "counts": {"included_files": len(selected_paths), "python_files_analyzed": len(python_files), "symbols": len(symbols), "source_bytes": source_bytes, "dump_filter_omissions": len(dump_omissions), "scanner_omissions": len(universe.omitted_files)}, "warnings": warnings}
     write_json_report(layout.latest_dir / "codebase_dump_index.json", index_payload)
     outputs = {"codebase_dump_md": f".codecontext/latest/{dump_name}", "codebase_dump_index_json": ".codecontext/latest/codebase_dump_index.json"}
     if out_file:

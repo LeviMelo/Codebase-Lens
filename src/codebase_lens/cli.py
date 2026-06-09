@@ -102,6 +102,8 @@ def build_parser() -> argparse.ArgumentParser:
     dump = sub.add_parser("dump", parents=[parent], help="Write a search-optimized Markdown source corpus dump.")
     dump.add_argument("--tracked-only", action="store_true", default=True, help="Include safe Git-tracked source files only. This is the default.")
     dump.add_argument("--include-untracked", action="store_true", help="Also include safe untracked, non-ignored source files.")
+    dump.add_argument("--path", action="append", default=[], help="Restrict dump to a repository-relative file or directory. Repeatable. Example: --path src")
+    dump.add_argument("--cwd-scope", action="store_true", help="Restrict dump to the current working directory inside the detected repository root.")
     dump.add_argument("--out-file", help="Optional repository-relative copy of the dump Markdown file.")
     dump.add_argument("--output-format", choices=("markdown", "text"), default="markdown", help="Output syntax. Markdown is the default and recommended format.")
     dump.add_argument("--include-json", action="store_true", help="Include selected source-adjacent JSON config files.")
@@ -356,7 +358,13 @@ def _run_dump(args: argparse.Namespace) -> int:
         root_info = _detect_root(args)
         repo_root = root_info.root
         layout = prepare_output_layout(repo_root, args.out, archive=not args.no_archive)
-        result = write_codebase_dump(layout, repo_root, max_file_bytes=args.max_file_bytes, tracked_only=args.tracked_only, include_untracked=args.include_untracked, include_tests=not args.exclude_tests, include_docs=not args.exclude_docs, include_config=not args.exclude_config, include_json=args.include_json, out_file=args.out_file, output_format=args.output_format, line_numbers=not args.no_line_numbers, max_total_bytes=args.max_total_bytes)
+        scope_paths = tuple(args.path or ())
+        if args.cwd_scope:
+            cwd_scope = to_posix_relative(repo_root, Path.cwd()).strip("/")
+            if cwd_scope and cwd_scope != ".":
+                scope_paths = (*scope_paths, cwd_scope)
+
+        result = write_codebase_dump(layout, repo_root, max_file_bytes=args.max_file_bytes, tracked_only=args.tracked_only, include_untracked=args.include_untracked, include_tests=not args.exclude_tests, include_docs=not args.exclude_docs, include_config=not args.exclude_config, include_json=args.include_json, out_file=args.out_file, output_format=args.output_format, line_numbers=not args.no_line_numbers, max_total_bytes=args.max_total_bytes, scope_paths=scope_paths)
         outputs = {"manifest_json": ".codecontext/latest/manifest.json", **result.outputs}
         manifest = build_manifest(**_base_manifest_args(args, repo_root, "dump", outputs, file_universe=result.file_universe, redaction=result.redaction))
         manifest_path = write_manifest_bundle(layout, manifest)
@@ -373,6 +381,7 @@ def _run_dump(args: argparse.Namespace) -> int:
         print(redact_console_text(f"ERROR: {exc}")); return EXIT_GENERAL_ERROR
     if not args.quiet:
         print("CBL dump: OK")
+        print(f"Scope: {', '.join(scope_paths) if scope_paths else '<repository>'}")
         print(f"Included source files: {result.counts.get('included_files', 0)}")
         print(f"Python files analyzed: {result.counts.get('python_files_analyzed', 0)}")
         print(f"Symbols indexed: {result.counts.get('symbols', 0)}")
