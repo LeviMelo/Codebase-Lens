@@ -105,6 +105,7 @@ def builtin_cbl_contract() -> dict[str, Any]:
             "docs/V0_1_RELEASE_STATUS.md",
             "scripts/dev/audits/audit_phase26_v01_release_closure.py",
             "scripts/dev/audits/audit_phase27_reliability_corrections.py",
+            "scripts/dev/audits/audit_phase28_manifest_consistency.py",
 ],
         "required_symbols": [
             {
@@ -260,6 +261,15 @@ def builtin_cbl_contract() -> dict[str, Any]:
                 "symbols": [
                     "classify_test_path",
                     "TestLikeSymbolRecord",
+                ],
+            },
+            {
+                "path": "scripts/dev/audits/audit_phase28_manifest_consistency.py",
+                "symbols": [
+                    "ManifestConsistencyIssue",
+                    "ManifestConsistencyResult",
+                    "run_manifest_consistency_audit",
+                    "main",
                 ],
             },
 ],

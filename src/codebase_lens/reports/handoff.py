@@ -17,6 +17,7 @@ class HandoffPackResult:
     outputs: dict[str, str]
     counts: dict[str, int]
     warnings: tuple[str, ...]
+    file_universe: dict[str, int]
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -331,4 +332,5 @@ def write_handoff_pack(
         outputs=outputs,
         counts=counts,
         warnings=tuple(warnings),
+        file_universe=dict(snapshot.file_universe),
     )

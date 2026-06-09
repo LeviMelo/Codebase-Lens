@@ -35,6 +35,7 @@ class FileUniverseResult:
             "tracked_included_count": self.counts.get("tracked_included_count", 0),
             "untracked_included_count": self.counts.get("untracked_included_count", 0),
             "ignored_count": self.counts.get("ignored_count", 0),
+            "hard_excluded_ignored_count": self.counts.get("hard_excluded_ignored_count", 0),
             "hard_excluded_count": self.counts.get("hard_excluded_count", 0),
             "large_skipped_count": self.counts.get("large_skipped_count", 0),
             "binary_skipped_count": self.counts.get("binary_skipped_count", 0),
@@ -42,8 +43,24 @@ class FileUniverseResult:
             "redacted_file_count": self.counts.get("redacted_file_count", 0),
             "unsupported_extension_count": self.counts.get("unsupported_extension_count", 0),
             "included_count": self.counts.get("included_count", 0),
+            "omitted_files_count": self.counts.get("omitted_files_count", 0),
         }
 
+
+def _split_ignored_counts(ignored_paths: tuple[str, ...]) -> tuple[int, int]:
+    hard_excluded = 0
+    ordinary = 0
+
+    for raw_path in ignored_paths:
+        relative = raw_path.replace("\\", "/").strip("/")
+        if not relative:
+            continue
+        if is_hard_excluded_relative(relative):
+            hard_excluded += 1
+        else:
+            ordinary += 1
+
+    return ordinary, hard_excluded
 
 def _empty_counts() -> dict[str, int]:
     return {
@@ -54,7 +71,9 @@ def _empty_counts() -> dict[str, int]:
         "untracked_included_count": 0,
         "filesystem_included_count": 0,
         "included_count": 0,
+        "omitted_files_count": 0,
         "ignored_count": 0,
+        "hard_excluded_ignored_count": 0,
         "hard_excluded_count": 0,
         "large_skipped_count": 0,
         "binary_skipped_count": 0,
@@ -170,7 +189,9 @@ def discover_file_universe(
     root = Path(repo_root).resolve()
     git_sets = collect_git_file_sets(root)
     counts = _empty_counts()
-    counts["ignored_count"] = len(git_sets.ignored)
+    ignored_count, hard_excluded_ignored_count = _split_ignored_counts(git_sets.ignored)
+    counts["ignored_count"] = ignored_count
+    counts["hard_excluded_ignored_count"] = hard_excluded_ignored_count
 
     if git_sets.is_repo:
         counts["tracked_candidate_count"] = len(git_sets.tracked)
@@ -264,6 +285,7 @@ def discover_file_universe(
     omitted = sorted(omitted, key=lambda record: record.path)
 
     counts["included_count"] = len(included)
+    counts["omitted_files_count"] = len(omitted)
     counts["redacted_occurrences_count"] = redacted_occurrences_count
 
     return FileUniverseResult(

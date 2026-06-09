@@ -895,6 +895,7 @@ def _run_snapshot(args: argparse.Namespace) -> int:
                 repo_root,
                 "snapshot",
                 outputs,
+                file_universe=result.file_universe,
             )
         )
         manifest_path = write_manifest_bundle(layout, manifest)
@@ -972,6 +973,7 @@ def _run_graph(args: argparse.Namespace) -> int:
                 repo_root,
                 "graph",
                 outputs,
+                file_universe=snapshot_result.file_universe,
             )
         )
         write_manifest_bundle(layout, manifest)
@@ -1032,6 +1034,7 @@ def _run_pack(args: argparse.Namespace) -> int:
                 repo_root,
                 "pack",
                 outputs,
+                file_universe=result.file_universe,
             )
         )
         manifest_path = write_manifest_bundle(layout, manifest)

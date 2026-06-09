@@ -39,6 +39,7 @@ class SnapshotBundleResult:
     counts: dict[str, int]
     warnings: tuple[str, ...]
     changed_only: bool
+    file_universe: dict[str, int]
 
 
 def _jsonable(value: Any) -> Any:
@@ -613,6 +614,7 @@ def write_snapshot_bundle(
         "changed_files": changed_file_count,
         "changed_symbols": changed_symbol_count,
         "omissions": len(_omitted_files(universe)),
+        "omitted_files_count": len(_omitted_files(universe)),
         "symbol_graph_nodes": graph_result.counts.get("nodes", 0),
         "symbol_graph_call_edges": graph_result.counts.get("call_edges", 0),
         "symbol_graph_caller_edges": graph_result.counts.get("caller_edges", 0),
@@ -650,4 +652,5 @@ def write_snapshot_bundle(
         counts=counts,
         warnings=tuple(warnings),
         changed_only=changed_only,
+        file_universe=universe.manifest_counts(),
     )
