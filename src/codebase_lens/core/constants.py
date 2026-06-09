@@ -12,6 +12,7 @@ PARTIAL_IMPLEMENTATION_MESSAGE = (
 
 PUBLIC_COMMANDS = (
     "doctor",
+    "dump",
     "snapshot",
     "tree",
     "symbols",
@@ -20,6 +21,7 @@ PUBLIC_COMMANDS = (
     "routes",
     "tests",
     "diff",
+    "diffdump",
     "changed",
     "file",
     "symbol",

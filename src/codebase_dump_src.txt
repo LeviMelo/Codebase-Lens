@@ -1316,9 +1316,11 @@ def render_excerpt_markdown(excerpt: FileExcerpt) -> str:
 ###############################################################################
 from __future__ import annotations
 
-from collections import Counter, deque
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
+
+UnresolvedMode = Literal["seed", "selected", "none"]
 
 
 @dataclass(frozen=True)
@@ -1326,7 +1328,7 @@ class GraphQueryResult:
     query: dict[str, Any]
     nodes: tuple[dict[str, Any], ...]
     edges: tuple[dict[str, Any], ...]
-    counts: dict[str, int]
+    counts: dict[str, int | dict[str, int]]
     warnings: tuple[str, ...]
 
 
@@ -1464,8 +1466,28 @@ def _expand(seed_ids: set[str], edges: list[dict[str, Any]], *, depth: int) -> s
     return visited
 
 
-def _selected_edges(edges: list[dict[str, Any]], selected_ids: set[str], *, include_unresolved_for_selected: bool = True) -> tuple[dict[str, Any], ...]:
+def _unresolved_sources_for_mode(mode: str, *, seed_ids: set[str], selected_ids: set[str]) -> set[str]:
+    if mode == "none":
+        return set()
+    if mode == "selected":
+        return set(selected_ids)
+    return set(seed_ids)
+
+
+def _selected_edges(
+    edges: list[dict[str, Any]],
+    selected_ids: set[str],
+    *,
+    seed_ids: set[str],
+    unresolved_mode: str = "seed",
+    unresolved_per_source_limit: int = 25,
+    total_edge_limit: int = 250,
+) -> tuple[tuple[dict[str, Any], ...], dict[str, int]]:
     values: list[dict[str, Any]] = []
+    omitted_unresolved = 0
+    omitted_by_total_limit = 0
+    unresolved_seen_by_source: dict[str, int] = defaultdict(int)
+    unresolved_sources = _unresolved_sources_for_mode(unresolved_mode, seed_ids=seed_ids, selected_ids=selected_ids)
 
     for edge in edges:
         source = str(edge.get("source") or "")
@@ -1475,14 +1497,27 @@ def _selected_edges(edges: list[dict[str, Any]], selected_ids: set[str], *, incl
             values.append(edge)
             continue
 
-        if include_unresolved_for_selected and source in selected_ids and not target:
+        if source in unresolved_sources and not target:
+            unresolved_seen_by_source[source] += 1
+            if unresolved_seen_by_source[source] > unresolved_per_source_limit:
+                omitted_unresolved += 1
+                continue
             values.append(edge)
 
     by_id: dict[str, dict[str, Any]] = {}
     for edge in values:
         by_id[str(edge.get("id"))] = edge
 
-    return tuple(sorted(by_id.values(), key=lambda item: (str(item.get("kind")), str(item.get("source")), str(item.get("target") or ""), str(item.get("target_text") or ""))))
+    sorted_values = tuple(sorted(by_id.values(), key=lambda item: (str(item.get("kind")), str(item.get("source")), str(item.get("target") or ""), str(item.get("target_text") or ""))))
+
+    if total_edge_limit > 0 and len(sorted_values) > total_edge_limit:
+        omitted_by_total_limit = len(sorted_values) - total_edge_limit
+        sorted_values = sorted_values[:total_edge_limit]
+
+    return sorted_values, {
+        "omitted_unresolved_edges": omitted_unresolved,
+        "omitted_edges_by_limit": omitted_by_total_limit,
+    }
 
 
 def query_evidence_graph_payload(
@@ -1494,30 +1529,29 @@ def query_evidence_graph_payload(
     changed: bool = False,
     depth: int = 1,
     limit: int = 60,
+    unresolved_mode: UnresolvedMode = "seed",
 ) -> GraphQueryResult:
     nodes = [node for node in graph_payload.get("nodes", []) if isinstance(node, dict)]
     edges = [edge for edge in graph_payload.get("edges", []) if isinstance(edge, dict)]
+
+    if unresolved_mode not in {"seed", "selected", "none"}:
+        unresolved_mode = "seed"
 
     seed_ids: set[str] = set()
     warnings: list[str] = []
 
     if symbol:
         seed_ids.update(_node_id(node) for node in nodes if _matches_symbol(node, symbol))
-
     if path:
         seed_ids.update(_node_id(node) for node in nodes if _matches_path(node, path))
-
     if module:
         seed_ids.update(_node_id(node) for node in nodes if _matches_module(node, module))
-
     if changed:
         seed_ids.update(_changed_seed_nodes(nodes, edges))
 
     explicit_query = bool(symbol or path or module or changed)
-
     if explicit_query and not seed_ids:
         warnings.append("No graph nodes matched the requested query.")
-
     if not explicit_query:
         seed_ids.update(_default_seed_nodes(nodes, edges, limit=limit))
         if not seed_ids:
@@ -1525,19 +1559,26 @@ def query_evidence_graph_payload(
 
     selected_ids = _expand(seed_ids, edges, depth=max(0, depth))
     selected_nodes = [node for node in nodes if _node_id(node) in selected_ids]
-    selected_edges = _selected_edges(edges, selected_ids)
 
-    selected_nodes = sorted(
-        selected_nodes,
-        key=lambda node: (
+    def _query_node_priority(node: dict[str, Any]) -> tuple[int, int, str, str, str]:
+        node_id = _node_id(node)
+        return (
+            0 if node_id in seed_ids else 1,
             0 if _node_path(node).startswith("src/codebase_lens/") else 1,
             str(node.get("kind")),
             _node_path(node),
             _node_label(node),
-        ),
-    )[: max(limit, len(seed_ids))]
+        )
 
+    selected_nodes = sorted(selected_nodes, key=_query_node_priority)[: max(limit, len(seed_ids))]
     retained_ids = {_node_id(node) for node in selected_nodes}
+
+    selected_edges, omitted_counts = _selected_edges(
+        edges,
+        selected_ids,
+        seed_ids=seed_ids,
+        unresolved_mode=unresolved_mode,
+    )
     selected_edges = tuple(
         edge
         for edge in selected_edges
@@ -1548,6 +1589,11 @@ def query_evidence_graph_payload(
     edge_kinds = Counter(str(edge.get("kind")) for edge in selected_edges)
     node_kinds = Counter(str(node.get("kind")) for node in selected_nodes)
 
+    if omitted_counts["omitted_unresolved_edges"]:
+        warnings.append(f"Omitted {omitted_counts['omitted_unresolved_edges']} unresolved call-name edges by per-source cap.")
+    if omitted_counts["omitted_edges_by_limit"]:
+        warnings.append(f"Omitted {omitted_counts['omitted_edges_by_limit']} graph edges by total edge cap.")
+
     return GraphQueryResult(
         query={
             "symbol": symbol,
@@ -1557,6 +1603,7 @@ def query_evidence_graph_payload(
             "depth": depth,
             "limit": limit,
             "seed_count": len(seed_ids),
+            "unresolved_mode": unresolved_mode,
         },
         nodes=tuple(selected_nodes),
         edges=selected_edges,
@@ -1565,6 +1612,8 @@ def query_evidence_graph_payload(
             "edges": len(selected_edges),
             "seed_nodes": len(seed_ids),
             "unresolved_edges": sum(1 for edge in selected_edges if not edge.get("target")),
+            "omitted_unresolved_edges": omitted_counts["omitted_unresolved_edges"],
+            "omitted_edges_by_limit": omitted_counts["omitted_edges_by_limit"],
             "node_kinds": dict(sorted(node_kinds.items())),
             "edge_kinds": dict(sorted(edge_kinds.items())),
         },
@@ -1576,7 +1625,7 @@ def graph_query_payload(result: GraphQueryResult) -> dict[str, Any]:
     return {
         "schema": {
             "name": "cbl.graph_query",
-            "version": 1,
+            "version": 2,
         },
         "query": dict(result.query),
         "nodes": list(result.nodes),
@@ -2394,27 +2443,62 @@ def _call_name(node: ast.Call) -> str | None:
     return _unparse(func)
 
 
+def _iter_child_nodes_without_nested_definitions(node: ast.AST):
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        yield child
+        yield from _iter_child_nodes_without_nested_definitions(child)
+
+
 def _calls_for(node: ast.AST) -> tuple[CallEdge, ...]:
     values: list[CallEdge] = []
-    for child in ast.walk(node):
-        if isinstance(child, ast.Call):
-            name = _call_name(child)
-            if not name:
-                continue
-            confidence = "medium" if "." in name else "high"
-            values.append(CallEdge(name=name, line=getattr(child, "lineno", 0), confidence=confidence))
+    seen: set[tuple[str, int, str]] = set()
+
+    if isinstance(node, ast.ClassDef):
+        scan_roots: list[ast.AST] = [*node.decorator_list, *node.bases, *node.keywords]
+        scan_roots.extend(item for item in node.body if not isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)))
+    elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        scan_roots = [*node.decorator_list, *node.args.defaults, *node.args.kw_defaults]
+        if node.returns is not None:
+            scan_roots.append(node.returns)
+        scan_roots.extend(node.body)
+    else:
+        scan_roots = [node]
+
+    for root in scan_roots:
+        if root is None:
+            continue
+        candidates = [root]
+        candidates.extend(_iter_child_nodes_without_nested_definitions(root))
+        for child in candidates:
+            if isinstance(child, ast.Call):
+                name = _call_name(child)
+                if not name:
+                    continue
+                confidence = "medium" if "." in name else "high"
+                key = (name, int(getattr(child, "lineno", 0)), confidence)
+                if key in seen:
+                    continue
+                seen.add(key)
+                values.append(CallEdge(name=name, line=key[1], confidence=confidence))
+
     return tuple(values)
 
 
 def _returns_for(node: ast.AST) -> tuple[ReturnObservation, ...]:
     values: list[ReturnObservation] = []
-    for child in ast.walk(node):
+    seen: set[tuple[int, str]] = set()
+
+    for child in _iter_child_nodes_without_nested_definitions(node):
         if isinstance(child, ast.Return):
             expression = _unparse(child.value) if child.value is not None else "None"
-            values.append(ReturnObservation(line=getattr(child, "lineno", 0), expression=(expression or "<unparseable>")[:300]))
+            item = ReturnObservation(line=getattr(child, "lineno", 0), expression=(expression or "<unparseable>")[:300])
+            key = (item.line, item.expression)
+            if key not in seen:
+                seen.add(key)
+                values.append(item)
     return tuple(values)
-
-
 def _imports_for(tree: ast.Module) -> dict[str, str]:
     values: dict[str, str] = {}
     for node in ast.walk(tree):
@@ -2444,13 +2528,41 @@ def _symbol_id(path: str, qualified_name: str, start_line: int, end_line: int) -
     return f"{path}:{qualified_name}:L{start_line}-L{end_line}"
 
 
+def _iter_control_flow_bodies(node: ast.AST) -> tuple[list[ast.stmt], ...]:
+    bodies: list[list[ast.stmt]] = []
+    for attr in ("body", "orelse", "finalbody"):
+        value = getattr(node, attr, None)
+        if isinstance(value, list):
+            bodies.append(value)
+    handlers = getattr(node, "handlers", None)
+    if isinstance(handlers, list):
+        for handler in handlers:
+            value = getattr(handler, "body", None)
+            if isinstance(value, list):
+                bodies.append(value)
+    cases = getattr(node, "cases", None)
+    if isinstance(cases, list):
+        for case in cases:
+            value = getattr(case, "body", None)
+            if isinstance(value, list):
+                bodies.append(value)
+    return tuple(bodies)
+
+
+def _function_kind(parent_stack: tuple[tuple[str, str], ...], node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+    if parent_stack and parent_stack[-1][1] == "class":
+        return "async_method" if isinstance(node, ast.AsyncFunctionDef) else "method"
+    return "async_function" if isinstance(node, ast.AsyncFunctionDef) else "function"
+
+
 def _iter_symbols(tree: ast.Module, path: str, lines: list[str]) -> tuple[_RawSymbol, ...]:
     imported_names = _imports_for(tree)
     symbols: list[_RawSymbol] = []
 
-    def visit_body(body: list[ast.stmt], prefix: tuple[str, ...]) -> None:
+    def visit_body(body: list[ast.stmt], stack: tuple[tuple[str, str], ...]) -> None:
         for item in body:
             if isinstance(item, ast.ClassDef):
+                prefix = tuple(name for name, _kind in stack)
                 qualified = ".".join((*prefix, item.name))
                 symbols.append(
                     _RawSymbol(
@@ -2468,15 +2580,18 @@ def _iter_symbols(tree: ast.Module, path: str, lines: list[str]) -> tuple[_RawSy
                         imported_names=imported_names,
                     )
                 )
-                visit_body(item.body, (*prefix, item.name))
+                visit_body(item.body, (*stack, (item.name, "class")))
+                continue
 
-            elif isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                prefix = tuple(name for name, _kind in stack)
                 qualified = ".".join((*prefix, item.name))
+                kind = _function_kind(stack, item)
                 symbols.append(
                     _RawSymbol(
                         qualified_name=qualified,
                         simple_name=item.name,
-                        kind="async_function" if isinstance(item, ast.AsyncFunctionDef) else "function",
+                        kind=kind,
                         path=path,
                         start_line=item.lineno,
                         end_line=getattr(item, "end_lineno", item.lineno),
@@ -2488,13 +2603,14 @@ def _iter_symbols(tree: ast.Module, path: str, lines: list[str]) -> tuple[_RawSy
                         imported_names=imported_names,
                     )
                 )
+                visit_body(item.body, (*stack, (item.name, kind)))
+                continue
 
-                visit_body(item.body, (*prefix, item.name))
+            for child_body in _iter_control_flow_bodies(item):
+                visit_body(child_body, stack)
 
     visit_body(tree.body, ())
     return tuple(symbols)
-
-
 def _likely_tests_for(raw: _RawSymbol, all_paths: tuple[str, ...]) -> tuple[str, ...]:
     simple = raw.simple_name.lower()
     module_stem = Path(raw.path).stem.lower()
@@ -2535,39 +2651,38 @@ def _resolve_call_targets(
 ) -> tuple[_RawSymbol, ...]:
     call_name = call.name
     base = call_name.split(".", 1)[0]
+    targets: list[_RawSymbol] = []
 
     if "." not in call_name:
         same_file = tuple(symbols_by_file_simple.get((source.path, call_name), ()))
         if same_file:
-            return tuple(target for target in same_file if target.qualified_name != source.qualified_name)
+            targets.extend(target for target in same_file if target.qualified_name != source.qualified_name)
+        else:
+            imported = source.imported_names.get(call_name)
+            if imported:
+                targets.extend(symbols_by_import_name.get(imported, ()))
 
-        imported = source.imported_names.get(call_name)
-        if imported:
-            return tuple(symbols_by_import_name.get(imported, ()))
-
-        return ()
-
-    if call_name.startswith(("self.", "cls.")):
+    elif call_name.startswith(("self.", "cls.")):
         method_name = call_name.split(".")[-1]
-        if "." not in source.qualified_name:
-            return ()
+        if "." in source.qualified_name:
+            owner = source.qualified_name.rsplit(".", 1)[0]
+            expected = f"{owner}.{method_name}"
+            targets.extend(
+                target
+                for target in symbols_by_file_simple.get((source.path, method_name), ())
+                if target.qualified_name == expected
+            )
 
-        owner = source.qualified_name.rsplit(".", 1)[0]
-        expected = f"{owner}.{method_name}"
-        return tuple(
-            target
-            for target in symbols_by_file_simple.get((source.path, method_name), ())
-            if target.qualified_name == expected
-        )
+    else:
+        imported = source.imported_names.get(base)
+        if imported:
+            suffix = call_name[len(base) :]
+            targets.extend(symbols_by_import_name.get(imported + suffix, ()))
 
-    imported = source.imported_names.get(base)
-    if imported:
-        suffix = call_name[len(base) :]
-        return tuple(symbols_by_import_name.get(imported + suffix, ()))
-
-    return ()
-
-
+    by_id: dict[str, _RawSymbol] = {}
+    for target in targets:
+        by_id[_symbol_id(target.path, target.qualified_name, target.start_line, target.end_line)] = target
+    return tuple(by_id.values())
 def collect_symbol_graph(
     repo_root: str | Path,
     python_files: list[str],
@@ -2609,6 +2724,7 @@ def collect_symbol_graph(
             symbols_by_import_name.setdefault(f"{module_name}.{target.qualified_name}", []).append(target)
 
     callers_by_target: dict[str, list[CallerEdge]] = {}
+    caller_seen: set[tuple[str, str, str, int, str]] = set()
     for source in raw_symbols:
         for call in source.calls:
             targets = _resolve_call_targets(
@@ -2622,6 +2738,10 @@ def collect_symbol_graph(
                     continue
 
                 target_id = _symbol_id(target.path, target.qualified_name, target.start_line, target.end_line)
+                key = (target_id, source.path, source.qualified_name, call.line, call.confidence)
+                if key in caller_seen:
+                    continue
+                caller_seen.add(key)
                 callers_by_target.setdefault(target_id, []).append(
                     CallerEdge(
                         symbol=source.qualified_name,
@@ -2671,7 +2791,7 @@ def collect_symbol_graph(
         nodes=tuple(nodes),
         counts={
             "nodes": len(nodes),
-            "functions": sum(1 for node in nodes if node.kind in {"function", "async_function"}),
+            "functions": sum(1 for node in nodes if node.kind in {"function", "async_function", "method", "async_method"}),
             "classes": sum(1 for node in nodes if node.kind == "class"),
             "call_edges": sum(len(node.calls) for node in nodes),
             "caller_edges": sum(len(node.called_by) for node in nodes),
@@ -2842,9 +2962,20 @@ class TestFixtureRecord:
 
 
 @dataclass(frozen=True)
+class TestLikeSymbolRecord:
+    path: str
+    name: str
+    kind: str
+    line: int
+    reason: str
+    confidence: str
+
+
+@dataclass(frozen=True)
 class TestInventoryResult:
     tests: tuple[TestRecord, ...]
     fixtures: tuple[TestFixtureRecord, ...]
+    test_like_symbols: tuple[TestLikeSymbolRecord, ...]
     syntax_errors: tuple[str, ...]
     warnings: tuple[str, ...]
 
@@ -2883,14 +3014,33 @@ def _fixture_metadata(node: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[boo
     return (False, None, None)
 
 
+def classify_test_path(path: str) -> str:
+    normalized = path.replace("\\", "/")
+    name = Path(normalized).name
+    parts = tuple(part for part in normalized.split("/") if part)
+
+    if name == "conftest.py":
+        return "fixture_container"
+    if normalized.startswith("tests/") or "tests" in parts:
+        return "test_file"
+    if name.startswith("test_") and name.endswith(".py"):
+        return "test_file"
+    if name.endswith("_test.py"):
+        return "test_file"
+    return "non_test_source"
+
+
 def _is_test_file(path: str) -> bool:
-    name = Path(path).name
-    parts = set(Path(path).parts)
-    return name.startswith("test_") or name.endswith("_test.py") or "tests" in parts or "test" in parts
+    return classify_test_path(path) == "test_file"
 
 
 def _test_kind(path: str) -> str:
-    return "pytest" if _is_test_file(path) else "python"
+    classification = classify_test_path(path)
+    if classification == "fixture_container":
+        return "pytest_fixture_container"
+    if classification == "test_file":
+        return "pytest"
+    return "test_like_source"
 
 
 def _likely_targets_from_name(name: str) -> list[str]:
@@ -2917,9 +3067,19 @@ def _likely_targets_from_name(name: str) -> list[str]:
 class _TestVisitor(ast.NodeVisitor):
     def __init__(self, *, relative_path: str) -> None:
         self.relative_path = relative_path
+        self.path_class = classify_test_path(relative_path)
         self.test_functions: list[str] = []
         self.test_classes: list[str] = []
+        self.test_like_symbols: list[TestLikeSymbolRecord] = []
         self.fixtures: list[TestFixtureRecord] = []
+
+    @property
+    def is_real_test_file(self) -> bool:
+        return self.path_class == "test_file"
+
+    @property
+    def allows_fixtures(self) -> bool:
+        return self.path_class in {"test_file", "fixture_container"}
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._visit_function(node)
@@ -2931,12 +3091,24 @@ class _TestVisitor(ast.NodeVisitor):
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         if node.name.startswith("Test"):
-            self.test_classes.append(node.name)
+            if self.is_real_test_file:
+                self.test_classes.append(node.name)
+            else:
+                self.test_like_symbols.append(
+                    TestLikeSymbolRecord(
+                        path=self.relative_path,
+                        name=node.name,
+                        kind="class",
+                        line=int(getattr(node, "lineno", 1)),
+                        reason="production_class_name_starts_with_Test",
+                        confidence="medium",
+                    )
+                )
         self.generic_visit(node)
 
     def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
         is_fixture, scope, autouse = _fixture_metadata(node)
-        if is_fixture:
+        if is_fixture and self.allows_fixtures:
             self.fixtures.append(
                 TestFixtureRecord(
                     path=self.relative_path,
@@ -2947,19 +3119,45 @@ class _TestVisitor(ast.NodeVisitor):
                     confidence="high",
                 )
             )
+        elif is_fixture:
+            self.test_like_symbols.append(
+                TestLikeSymbolRecord(
+                    path=self.relative_path,
+                    name=node.name,
+                    kind="fixture",
+                    line=int(getattr(node, "lineno", 1)),
+                    reason="pytest_fixture_declared_outside_test_path",
+                    confidence="medium",
+                )
+            )
 
         if node.name.startswith("test_"):
-            self.test_functions.append(node.name)
+            if self.is_real_test_file:
+                self.test_functions.append(node.name)
+            else:
+                self.test_like_symbols.append(
+                    TestLikeSymbolRecord(
+                        path=self.relative_path,
+                        name=node.name,
+                        kind="function",
+                        line=int(getattr(node, "lineno", 1)),
+                        reason="production_function_name_starts_with_test_",
+                        confidence="medium",
+                    )
+                )
 
 
-def collect_tests_for_file(repo_root: str | Path, file_path: str | Path) -> tuple[TestRecord | None, tuple[TestFixtureRecord, ...], tuple[str, ...]]:
+def collect_tests_for_file(
+    repo_root: str | Path,
+    file_path: str | Path,
+) -> tuple[TestRecord | None, tuple[TestFixtureRecord, ...], tuple[TestLikeSymbolRecord, ...], tuple[str, ...]]:
     root = Path(repo_root).resolve()
     target = Path(file_path).resolve()
     relative = to_posix_relative(root, target)
 
     read_result = read_text_with_policy(target)
     if read_result.skipped_reason:
-        return None, (), (f"{relative}: skipped: {read_result.skipped_reason}",)
+        return None, (), (), (f"{relative}: skipped: {read_result.skipped_reason}",)
 
     source = read_result.text or ""
 
@@ -2967,13 +3165,10 @@ def collect_tests_for_file(repo_root: str | Path, file_path: str | Path) -> tupl
         tree = ast.parse(source, filename=relative)
     except SyntaxError as exc:
         message = f"{relative}:{exc.lineno or 0}:{exc.offset or 0}: {exc.msg}"
-        return None, (), (message,)
+        return None, (), (), (message,)
 
     visitor = _TestVisitor(relative_path=relative)
     visitor.visit(tree)
-
-    if not visitor.test_functions and not visitor.test_classes and not visitor.fixtures and not _is_test_file(relative):
-        return None, tuple(visitor.fixtures), ()
 
     likely_targets: list[str] = []
     for name in [*visitor.test_functions, *visitor.test_classes]:
@@ -2981,16 +3176,23 @@ def collect_tests_for_file(repo_root: str | Path, file_path: str | Path) -> tupl
             if target_name not in likely_targets:
                 likely_targets.append(target_name)
 
-    record = TestRecord(
-        path=relative,
-        test_kind=_test_kind(relative),
-        test_functions=sorted(visitor.test_functions),
-        test_classes=sorted(visitor.test_classes),
-        likely_targets=likely_targets,
-        confidence="high" if _is_test_file(relative) else "medium",
-    )
+    record: TestRecord | None = None
+    if visitor.is_real_test_file and (visitor.test_functions or visitor.test_classes):
+        record = TestRecord(
+            path=relative,
+            test_kind=_test_kind(relative),
+            test_functions=sorted(visitor.test_functions),
+            test_classes=sorted(visitor.test_classes),
+            likely_targets=likely_targets,
+            confidence="high",
+        )
 
-    return record, tuple(sorted(visitor.fixtures, key=lambda item: (item.path, item.line, item.name))), ()
+    return (
+        record,
+        tuple(sorted(visitor.fixtures, key=lambda item: (item.path, item.line, item.name))),
+        tuple(sorted(visitor.test_like_symbols, key=lambda item: (item.path, item.line, item.kind, item.name))),
+        (),
+    )
 
 
 def collect_test_inventory(
@@ -3004,12 +3206,14 @@ def collect_test_inventory(
 
     tests: list[TestRecord] = []
     fixtures: list[TestFixtureRecord] = []
+    test_like_symbols: list[TestLikeSymbolRecord] = []
     syntax_errors: list[str] = []
 
     for path in python_files:
-        record, file_fixtures, errors = collect_tests_for_file(root, root / Path(path))
+        record, file_fixtures, file_test_like, errors = collect_tests_for_file(root, root / Path(path))
         syntax_errors.extend(errors)
         fixtures.extend(file_fixtures)
+        test_like_symbols.extend(file_test_like)
 
         if record is None:
             continue
@@ -3035,6 +3239,7 @@ def collect_test_inventory(
     return TestInventoryResult(
         tests=tuple(sorted(tests, key=lambda item: item.path)),
         fixtures=tuple(sorted(fixtures, key=lambda item: (item.path, item.line, item.name))),
+        test_like_symbols=tuple(sorted(test_like_symbols, key=lambda item: (item.path, item.line, item.kind, item.name))),
         syntax_errors=tuple(syntax_errors),
         warnings=(),
     )
@@ -3239,6 +3444,7 @@ def build_parser() -> argparse.ArgumentParser:
     graph.add_argument("--depth", type=int, default=1, help="Undirected graph expansion depth from seed nodes.")
     graph.add_argument("--limit", type=int, default=60, help="Maximum nodes to retain in the markdown-oriented query view.")
     graph.add_argument("--changed", action="store_true", help="Seed query from changed hunks and changed symbols.")
+    graph.add_argument("--unresolved", choices=("seed", "selected", "none"), default="seed", help="Control unresolved call-name edges in graph query output.")
     graph.set_defaults(handler=_run_graph)
 
     return parser
@@ -3940,6 +4146,7 @@ def _run_snapshot(args: argparse.Namespace) -> int:
                 repo_root,
                 "snapshot",
                 outputs,
+                file_universe=result.file_universe,
             )
         )
         manifest_path = write_manifest_bundle(layout, manifest)
@@ -4005,6 +4212,7 @@ def _run_graph(args: argparse.Namespace) -> int:
             changed=args.changed,
             depth=args.depth,
             limit=args.limit,
+            unresolved_mode=args.unresolved,
         )
 
         outputs = dict(snapshot_result.outputs)
@@ -4016,6 +4224,7 @@ def _run_graph(args: argparse.Namespace) -> int:
                 repo_root,
                 "graph",
                 outputs,
+                file_universe=snapshot_result.file_universe,
             )
         )
         write_manifest_bundle(layout, manifest)
@@ -4076,6 +4285,7 @@ def _run_pack(args: argparse.Namespace) -> int:
                 repo_root,
                 "pack",
                 outputs,
+                file_universe=result.file_universe,
             )
         )
         manifest_path = write_manifest_bundle(layout, manifest)
@@ -4628,6 +4838,8 @@ def builtin_cbl_contract() -> dict[str, Any]:
             "scripts/dev/audits/audit_phase25_report_contract_parity.py",
             "docs/V0_1_RELEASE_STATUS.md",
             "scripts/dev/audits/audit_phase26_v01_release_closure.py",
+            "scripts/dev/audits/audit_phase27_reliability_corrections.py",
+            "scripts/dev/audits/audit_phase28_manifest_consistency.py",
 ],
         "required_symbols": [
             {
@@ -4769,6 +4981,29 @@ def builtin_cbl_contract() -> dict[str, Any]:
                 "symbols": [
                     "render_contract_audit_markdown",
                     "write_contract_audit_reports",
+                ],
+            },
+            {
+                "path": "src/codebase_lens/core/redaction.py",
+                "symbols": [
+                    "redact_jsonable",
+                    "redact_string",
+                ],
+            },
+            {
+                "path": "src/codebase_lens/analyzers/tests.py",
+                "symbols": [
+                    "classify_test_path",
+                    "TestLikeSymbolRecord",
+                ],
+            },
+            {
+                "path": "scripts/dev/audits/audit_phase28_manifest_consistency.py",
+                "symbols": [
+                    "ManifestConsistencyIssue",
+                    "ManifestConsistencyResult",
+                    "run_manifest_consistency_audit",
+                    "main",
                 ],
             },
 ],
@@ -8053,6 +8288,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Any
 
 
 SECRET_KEYS = (
@@ -8091,6 +8327,11 @@ PRIVATE_KEY_BLOCK_RE = re.compile(
 
 SECRET_ASSIGNMENT_RE = re.compile(
     r"""(?P<prefix>(?P<key>["']?(?:API_KEY|OPENAI_API_KEY|ANTHROPIC_API_KEY|GEMINI_API_KEY|GOOGLE_API_KEY|SECRET|TOKEN|ACCESS_TOKEN|REFRESH_TOKEN|PASSWORD|PASSWD|PRIVATE_KEY|CLIENT_SECRET|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AZURE_CLIENT_SECRET|DATABASE_URL|POSTGRES_URL|MYSQL_URL|REDIS_URL|GOOGLE_APPLICATION_CREDENTIALS|GITHUB_TOKEN|GITLAB_TOKEN|SLACK_TOKEN|DISCORD_TOKEN|JWT_SECRET)["']?)\s*(?:=|:)\s*)(?P<quote>["']?)(?P<value>[^"'\s,}\]]+)(?P=quote)""",
+    re.IGNORECASE,
+)
+
+SECRET_VALUE_RE = re.compile(
+    r"(?:sk-[A-Za-z0-9][A-Za-z0-9_-]{8,}|fixture-(?:password|token)-[A-Za-z0-9_-]+|postgres://[^\s\"'`]+|mysql://[^\s\"'`]+|redis://[^\s\"'`]+)",
     re.IGNORECASE,
 )
 
@@ -8141,6 +8382,17 @@ def redact_text(text: str, *, enabled: bool = True) -> RedactionResult:
 
     redacted = SECRET_ASSIGNMENT_RE.sub(assignment_replacer, redacted)
 
+    def value_replacer(match: re.Match[str]) -> str:
+        nonlocal occurrences
+        value = match.group(0)
+        if value.startswith("<REDACTED"):
+            return value
+        occurrences += 1
+        patterns_hit.add("SECRET_VALUE")
+        return "<REDACTED_SECRET_VALUE>"
+
+    redacted = SECRET_VALUE_RE.sub(value_replacer, redacted)
+
     return RedactionResult(
         text=redacted,
         stats=RedactionStats(
@@ -8153,6 +8405,25 @@ def redact_text(text: str, *, enabled: bool = True) -> RedactionResult:
 
 def redact_console_text(text: str) -> str:
     return redact_text(text).text
+
+
+
+def redact_string(value: str, *, enabled: bool = True) -> str:
+    return redact_text(value, enabled=enabled).text
+
+
+def redact_jsonable(value: Any, *, enabled: bool = True) -> Any:
+    if not enabled:
+        return value
+    if isinstance(value, str):
+        return redact_string(value, enabled=enabled)
+    if isinstance(value, dict):
+        return {str(key): redact_jsonable(item, enabled=enabled) for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact_jsonable(item, enabled=enabled) for item in value]
+    if isinstance(value, tuple):
+        return [redact_jsonable(item, enabled=enabled) for item in value]
+    return value
 
 
 
@@ -9331,6 +9602,7 @@ from pathlib import Path
 from codebase_lens.core.graph import EvidenceGraph, evidence_graph_payload, graph_slice_payload
 from codebase_lens.reports.json import write_json_report
 from codebase_lens.reports.manifest import OutputLayout
+from codebase_lens.core.redaction import redact_console_text
 
 
 CALL_EDGE_KINDS = {
@@ -9463,9 +9735,9 @@ def render_graph_summary(graph: EvidenceGraph) -> str:
             "## Follow-Up Commands",
             "",
             "- `cbl graph --symbol <symbol> --depth 2` once graph querying is enabled.",
-            "- `cbl symbol --name <symbol> --context 80` for high-resolution source evidence.",
-            "- `cbl file --path <path> --lines <start>:<end>` for exact file excerpts.",
-            "- `cbl callers --name <symbol>` for legacy caller discovery.",
+            "- `cbl symbol <symbol> --context 80` for high-resolution source evidence.",
+            "- `cbl file <path> --lines <start>:<end>` for exact file excerpts.",
+            "- `cbl callers <symbol>` for legacy caller discovery.",
         ]
     )
 
@@ -9478,7 +9750,7 @@ def write_evidence_graph_reports(layout: OutputLayout, graph: EvidenceGraph) -> 
     write_json_report(layout.latest_dir / "module_graph.json", graph_slice_payload(graph, edge_kinds=MODULE_EDGE_KINDS))
 
     (layout.latest_dir / "graph_summary.md").write_text(
-        render_graph_summary(graph),
+        redact_console_text(render_graph_summary(graph)),
         encoding="utf-8",
         newline="\n",
     )
@@ -9503,6 +9775,7 @@ from typing import Any
 from codebase_lens.analyzers.graph_query import GraphQueryResult, graph_query_payload
 from codebase_lens.reports.json import write_json_report
 from codebase_lens.reports.manifest import OutputLayout
+from codebase_lens.core.redaction import redact_console_text
 
 
 def _node_location(node: dict[str, Any]) -> str:
@@ -9621,6 +9894,8 @@ def render_graph_query_markdown(result: GraphQueryResult) -> str:
         f"- Nodes: {result.counts.get('nodes', 0)}",
         f"- Edges: {result.counts.get('edges', 0)}",
         f"- Unresolved edges: {result.counts.get('unresolved_edges', 0)}",
+        f"- Omitted unresolved edges: {result.counts.get('omitted_unresolved_edges', 0)}",
+        f"- Omitted edges by total cap: {result.counts.get('omitted_edges_by_limit', 0)}",
         "",
         "## Node Kinds",
         "",
@@ -9659,9 +9934,9 @@ def render_graph_query_markdown(result: GraphQueryResult) -> str:
             "",
             "## Follow-Up Commands",
             "",
-            "- `cbl symbol --name <symbol> --context 80` for exact symbol source.",
-            "- `cbl file --path <path> --lines <start>:<end>` for exact line-range source.",
-            "- `cbl callers --name <symbol>` for legacy caller lookup.",
+            "- `cbl symbol <symbol> --context 80` for exact symbol source.",
+            "- `cbl file <path> --lines <start>:<end>` for exact line-range source.",
+            "- `cbl callers <symbol>` for legacy caller lookup.",
             "- `cbl graph --symbol <symbol> --depth 2` for a wider graph neighborhood.",
         ]
     )
@@ -9672,7 +9947,7 @@ def render_graph_query_markdown(result: GraphQueryResult) -> str:
 def write_graph_query_reports(layout: OutputLayout, result: GraphQueryResult) -> dict[str, str]:
     write_json_report(layout.latest_dir / "graph_query.json", graph_query_payload(result))
     (layout.latest_dir / "graph_query.md").write_text(
-        render_graph_query_markdown(result),
+        redact_console_text(render_graph_query_markdown(result)),
         encoding="utf-8",
         newline="\n",
     )
@@ -9698,6 +9973,7 @@ from codebase_lens.contracts.architecture import evaluate_contract, load_contrac
 from codebase_lens.reports.json import contract_result_payload, write_json_report
 from codebase_lens.reports.manifest import OutputLayout
 from codebase_lens.reports.snapshot import SnapshotBundleResult, write_snapshot_bundle
+from codebase_lens.core.redaction import redact_console_text
 
 
 @dataclass(frozen=True)
@@ -9705,6 +9981,7 @@ class HandoffPackResult:
     outputs: dict[str, str]
     counts: dict[str, int]
     warnings: tuple[str, ...]
+    file_universe: dict[str, int]
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -9777,7 +10054,7 @@ def _format_changed_symbols(layout: OutputLayout, *, max_items: int = 80) -> lis
 
 def _format_omissions(layout: OutputLayout, *, max_items: int = 60) -> list[str]:
     payload = _read_json(layout.latest_dir / "omissions.json")
-    records = payload.get("omissions", [])
+    records = payload.get("omitted_files") or payload.get("omissions", [])
     if not isinstance(records, list) or not records:
         return ["- No omitted files were reported by the scanner."]
 
@@ -9841,7 +10118,7 @@ def _changed_scope_notice(layout: OutputLayout, *, changed_only: bool) -> list[s
         "- `cbl pack --budget 16000`",
         "- `cbl snapshot --budget 16000`",
         "- `cbl symbols`",
-        "- `cbl callers --name <symbol>`",
+        "- `cbl callers <symbol>`",
     ]
 
 
@@ -9986,7 +10263,7 @@ def write_handoff_pack(
         markdown_lines.extend(f"- {warning}" for warning in warnings)
 
     handoff_path = layout.latest_dir / "ai_handoff.md"
-    handoff_path.write_text("\n".join(markdown_lines).rstrip() + "\n", encoding="utf-8", newline="\n")
+    handoff_path.write_text(redact_console_text("\n".join(markdown_lines).rstrip() + "\n"), encoding="utf-8", newline="\n")
     outputs["ai_handoff_md"] = ".codecontext/latest/ai_handoff.md"
 
     from codebase_lens.reports.handoff_projection import write_handoff_projection_reports
@@ -10019,6 +10296,7 @@ def write_handoff_pack(
         outputs=outputs,
         counts=counts,
         warnings=tuple(warnings),
+        file_universe=dict(snapshot.file_universe),
     )
 
 
@@ -10036,6 +10314,7 @@ from typing import Any
 
 from codebase_lens.reports.json import write_json_report
 from codebase_lens.reports.manifest import OutputLayout
+from codebase_lens.core.redaction import redact_console_text
 
 
 @dataclass(frozen=True)
@@ -11653,9 +11932,9 @@ def _render_projection_markdown(payload: dict[str, Any]) -> str:
             "",
             "- `cbl graph --symbol <symbol> --depth 2 --budget 24000`",
             "- `cbl graph --path <path> --depth 1 --budget 24000`",
-            "- `cbl symbol --name <symbol> --context 80`",
-            "- `cbl file --path <path> --lines <start>:<end>`",
-            "- `cbl callers --name <symbol>`",
+            "- `cbl symbol <symbol> --context 80`",
+            "- `cbl file <path> --lines <start>:<end>`",
+            "- `cbl callers <symbol>`",
             "- `cbl imports --module <module>`",
             "- `cbl pack --issue \"<issue>\" --budget 24000`",
             "",
@@ -11700,7 +11979,7 @@ def write_handoff_projection_reports(
 
     write_json_report(layout.latest_dir / "handoff_projection.json", payload)
     (layout.latest_dir / "handoff_projection.md").write_text(
-        _render_projection_markdown(payload),
+        redact_console_text(_render_projection_markdown(payload)),
         encoding="utf-8",
         newline="\n",
     )
@@ -11798,9 +12077,11 @@ def changed_files_payload(result: ChangedFileSet) -> dict[str, Any]:
 
 
 def test_inventory_payload(result: TestInventoryResult) -> dict[str, Any]:
+    test_like_symbols = tuple(getattr(result, "test_like_symbols", ()))
     return {
         "tests": [asdict(record) for record in result.tests],
         "fixtures": [asdict(record) for record in result.fixtures],
+        "test_like_symbols": [asdict(record) for record in test_like_symbols],
         "syntax_errors": list(result.syntax_errors),
         "warnings": list(result.warnings),
         "counts": {
@@ -11808,6 +12089,7 @@ def test_inventory_payload(result: TestInventoryResult) -> dict[str, Any]:
             "test_functions": sum(len(record.test_functions) for record in result.tests),
             "test_classes": sum(len(record.test_classes) for record in result.tests),
             "fixtures": len(result.fixtures),
+            "test_like_symbols": len(test_like_symbols),
         },
     }
 
@@ -11849,6 +12131,7 @@ from pathlib import Path
 from typing import Any
 
 from codebase_lens import TOOL_NAME, __version__
+from codebase_lens.core.redaction import redact_jsonable
 
 
 @dataclass(frozen=True)
@@ -11916,12 +12199,36 @@ def prepare_output_layout(
         run_dir=run_dir,
     )
 
+def _sanitize_argv(argv: list[str]) -> list[str]:
+    sanitized: list[str] = []
+    redact_next = False
+    value_options = {"--repo", "--out", "--spec"}
+    for item in argv:
+        if redact_next:
+            sanitized.append("<PATH_OR_SPEC_REDACTED>")
+            redact_next = False
+            continue
+        if item in value_options:
+            sanitized.append(item)
+            redact_next = True
+            continue
+        if item.startswith("--repo="):
+            sanitized.append("--repo=<PATH_OR_SPEC_REDACTED>")
+            continue
+        if item.startswith("--out="):
+            sanitized.append("--out=<PATH_OR_SPEC_REDACTED>")
+            continue
+        if item.startswith("--spec="):
+            sanitized.append("--spec=<PATH_OR_SPEC_REDACTED>")
+            continue
+        sanitized.append(str(redact_jsonable(item)))
+    return sanitized
 
 def write_json(path: str | Path, payload: dict[str, Any]) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(
-        json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+        json.dumps(redact_jsonable(payload), indent=2, sort_keys=True, ensure_ascii=False) + "\n",
         encoding="utf-8",
         newline="\n",
     )
@@ -11969,7 +12276,8 @@ def build_manifest(
         },
         "git": git,
         "command": {
-            "argv": argv,
+            "argv": _sanitize_argv(argv),
+            "argv_redacted_for_ai": True,
             "subcommand": subcommand,
             "budget": budget,
             "focus": focus,
@@ -11980,12 +12288,15 @@ def build_manifest(
             "tracked_included_count": 0,
             "untracked_included_count": 0,
             "ignored_count": 0,
+            "hard_excluded_ignored_count": 0,
             "hard_excluded_count": 0,
             "large_skipped_count": 0,
             "binary_skipped_count": 0,
             "decode_failed_count": 0,
             "redacted_file_count": 0,
+            "unsupported_extension_count": 0,
             "included_count": 0,
+            "omitted_files_count": 0,
         },
         "safety": {
             "redaction_enabled": redaction.get("enabled", True),
@@ -12091,6 +12402,7 @@ from codebase_lens.reports.scanner_outputs import write_file_inventory, write_tr
 from codebase_lens.scanners.universe import discover_file_universe
 from codebase_lens.core.budget import build_budget_report_payload
 from codebase_lens.git.discover import collect_git_info
+from codebase_lens.core.redaction import redact_console_text
 
 
 @dataclass(frozen=True)
@@ -12099,6 +12411,7 @@ class SnapshotBundleResult:
     counts: dict[str, int]
     warnings: tuple[str, ...]
     changed_only: bool
+    file_universe: dict[str, int]
 
 
 def _jsonable(value: Any) -> Any:
@@ -12111,6 +12424,14 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_jsonable(item) for item in value]
     return value
+
+
+
+def _omitted_files(universe: object) -> tuple[object, ...]:
+    value = getattr(universe, "omitted_files", None)
+    if value is None:
+        value = getattr(universe, "omissions", ())
+    return tuple(value or ())
 
 
 def _python_files_from_universe(universe) -> list[str]:
@@ -12164,16 +12485,19 @@ def _focus_hits_for_path(path: str, focus_terms: tuple[str, ...]) -> int:
 
 
 def _write_omissions_report(layout: OutputLayout, universe, *, changed_only: bool) -> Path:
+    omitted_files = [_jsonable(record) for record in _omitted_files(universe)]
     payload = {
         "schema": {
             "name": "cbl.omissions",
-            "version": 1,
+            "version": 2,
         },
         "scope": "changed" if changed_only else "full",
-        "omissions": [_jsonable(record) for record in getattr(universe, "omissions", ())],
+        "omitted_files": omitted_files,
+        "omissions": omitted_files,
         "warnings": list(getattr(universe, "warnings", ())),
         "counts": {
-            "omissions": len(getattr(universe, "omissions", ())),
+            "omitted_files": len(omitted_files),
+            "omissions": len(omitted_files),
             "warnings": len(getattr(universe, "warnings", ())),
             "hard_excluded_count": getattr(universe, "counts", {}).get("hard_excluded_count", 0),
             "large_skipped_count": getattr(universe, "counts", {}).get("large_skipped_count", 0),
@@ -12183,8 +12507,6 @@ def _write_omissions_report(layout: OutputLayout, universe, *, changed_only: boo
         },
     }
     return write_json_report(layout.latest_dir / "omissions.json", payload)
-
-
 def _write_budget_report(
     layout: OutputLayout,
     universe,
@@ -12460,7 +12782,7 @@ def _write_repo_snapshot_markdown(
         lines.append(f"- `{key}` → `{outputs[key]}`")
 
     destination = layout.latest_dir / "repo_snapshot.md"
-    destination.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8", newline="\n")
+    destination.write_text(redact_console_text("\n".join(lines).rstrip() + "\n"), encoding="utf-8", newline="\n")
     return destination
 
 def _write_snapshot_index(
@@ -12663,7 +12985,8 @@ def write_snapshot_bundle(
         "fixtures": len(test_inventory.fixtures),
         "changed_files": changed_file_count,
         "changed_symbols": changed_symbol_count,
-        "omissions": len(getattr(universe, "omissions", ())),
+        "omissions": len(_omitted_files(universe)),
+        "omitted_files_count": len(_omitted_files(universe)),
         "symbol_graph_nodes": graph_result.counts.get("nodes", 0),
         "symbol_graph_call_edges": graph_result.counts.get("call_edges", 0),
         "symbol_graph_caller_edges": graph_result.counts.get("caller_edges", 0),
@@ -12701,6 +13024,7 @@ def write_snapshot_bundle(
         counts=counts,
         warnings=tuple(warnings),
         changed_only=changed_only,
+        file_universe=universe.manifest_counts(),
     )
 
 
@@ -12719,6 +13043,7 @@ from codebase_lens.analyzers.symbol_graph import (
 )
 from codebase_lens.reports.json import write_json_report
 from codebase_lens.reports.manifest import OutputLayout
+from codebase_lens.core.redaction import redact_console_text
 
 
 def write_symbol_graph_reports(layout: OutputLayout, result: SymbolGraphResult) -> dict[str, str]:
@@ -12727,7 +13052,7 @@ def write_symbol_graph_reports(layout: OutputLayout, result: SymbolGraphResult) 
 
     write_json_report(json_path, symbol_graph_payload(result))
     markdown_path.write_text(
-        render_symbol_graph_markdown(result),
+        redact_console_text(render_symbol_graph_markdown(result)),
         encoding="utf-8",
         newline="\n",
     )
@@ -12775,18 +13100,26 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
+def _omitted_files(result: object) -> tuple[object, ...]:
+    value = getattr(result, "omitted_files", None)
+    if value is None:
+        value = getattr(result, "omissions", ())
+    return tuple(value or ())
+
+
 def file_universe_to_inventory(result) -> dict[str, Any]:
     """Convert a scanner FileUniverseResult into a serializable inventory payload.
 
-    This module intentionally does not write files and does not import report-layer
-    helpers. Scanner modules own file-universe semantics; report modules own output
-    persistence.
+    Scanner semantics use the canonical name ``omitted_files``. The legacy
+    ``omissions`` key remains in emitted JSON for one compatibility cycle.
     """
+
+    omitted = [_jsonable(record) for record in _omitted_files(result)]
 
     return {
         "schema": {
             "name": "cbl.file_inventory",
-            "version": 1,
+            "version": 2,
         },
         "repo": {
             "root": "<redacted>",
@@ -12795,7 +13128,8 @@ def file_universe_to_inventory(result) -> dict[str, Any]:
         "counts": dict(getattr(result, "counts", {})),
         "redaction": _jsonable(getattr(result, "redaction", None)),
         "files": [_jsonable(record) for record in getattr(result, "included_files", ())],
-        "omissions": [_jsonable(record) for record in getattr(result, "omissions", ())],
+        "omitted_files": omitted,
+        "omissions": omitted,
         "warnings": list(getattr(result, "warnings", ())),
     }
 
@@ -12850,6 +13184,13 @@ def _render_node(node: dict[str, Any], lines: list[str], *, prefix: str, depth: 
         lines.append(f"{prefix}{filename}")
 
 
+def _omitted_files(result: object) -> tuple[object, ...]:
+    value = getattr(result, "omitted_files", None)
+    if value is None:
+        value = getattr(result, "omissions", ())
+    return tuple(value or ())
+
+
 def render_tree_report(
     result,
     *,
@@ -12860,7 +13201,7 @@ def render_tree_report(
     """Render a scanner FileUniverseResult as text without report-layer imports."""
 
     included_files = list(getattr(result, "included_files", ()))
-    omissions = list(getattr(result, "omissions", ()))
+    omitted_files = list(_omitted_files(result))
     counts = dict(getattr(result, "counts", {}))
 
     tree: dict[str, Any] = {}
@@ -12899,14 +13240,14 @@ def render_tree_report(
 
     if show_skipped:
         lines.extend(["", "Skipped/omitted files:"])
-        if not omissions:
+        if not omitted_files:
             lines.append("(none)")
         else:
-            for record in omissions:
+            for record in omitted_files:
                 path = getattr(record, "path", "")
                 reason = getattr(record, "reason", "unknown")
-                evidence = getattr(record, "evidence", None)
-                suffix = f" ({evidence})" if evidence else ""
+                category = getattr(record, "category", None)
+                suffix = f" ({category})" if category else ""
                 lines.append(f"{path}: {reason}{suffix}")
 
     return "\n".join(lines)
@@ -12944,11 +13285,16 @@ class FileUniverseResult:
     redaction: RedactionStats
     warnings: tuple[str, ...]
 
+    @property
+    def omissions(self) -> tuple[OmissionRecord, ...]:
+        return self.omitted_files
+
     def manifest_counts(self) -> dict[str, int]:
         return {
             "tracked_included_count": self.counts.get("tracked_included_count", 0),
             "untracked_included_count": self.counts.get("untracked_included_count", 0),
             "ignored_count": self.counts.get("ignored_count", 0),
+            "hard_excluded_ignored_count": self.counts.get("hard_excluded_ignored_count", 0),
             "hard_excluded_count": self.counts.get("hard_excluded_count", 0),
             "large_skipped_count": self.counts.get("large_skipped_count", 0),
             "binary_skipped_count": self.counts.get("binary_skipped_count", 0),
@@ -12956,8 +13302,24 @@ class FileUniverseResult:
             "redacted_file_count": self.counts.get("redacted_file_count", 0),
             "unsupported_extension_count": self.counts.get("unsupported_extension_count", 0),
             "included_count": self.counts.get("included_count", 0),
+            "omitted_files_count": self.counts.get("omitted_files_count", 0),
         }
 
+
+def _split_ignored_counts(ignored_paths: tuple[str, ...]) -> tuple[int, int]:
+    hard_excluded = 0
+    ordinary = 0
+
+    for raw_path in ignored_paths:
+        relative = raw_path.replace("\\", "/").strip("/")
+        if not relative:
+            continue
+        if is_hard_excluded_relative(relative):
+            hard_excluded += 1
+        else:
+            ordinary += 1
+
+    return ordinary, hard_excluded
 
 def _empty_counts() -> dict[str, int]:
     return {
@@ -12968,7 +13330,9 @@ def _empty_counts() -> dict[str, int]:
         "untracked_included_count": 0,
         "filesystem_included_count": 0,
         "included_count": 0,
+        "omitted_files_count": 0,
         "ignored_count": 0,
+        "hard_excluded_ignored_count": 0,
         "hard_excluded_count": 0,
         "large_skipped_count": 0,
         "binary_skipped_count": 0,
@@ -13084,7 +13448,9 @@ def discover_file_universe(
     root = Path(repo_root).resolve()
     git_sets = collect_git_file_sets(root)
     counts = _empty_counts()
-    counts["ignored_count"] = len(git_sets.ignored)
+    ignored_count, hard_excluded_ignored_count = _split_ignored_counts(git_sets.ignored)
+    counts["ignored_count"] = ignored_count
+    counts["hard_excluded_ignored_count"] = hard_excluded_ignored_count
 
     if git_sets.is_repo:
         counts["tracked_candidate_count"] = len(git_sets.tracked)
@@ -13178,6 +13544,7 @@ def discover_file_universe(
     omitted = sorted(omitted, key=lambda record: record.path)
 
     counts["included_count"] = len(included)
+    counts["omitted_files_count"] = len(omitted)
     counts["redacted_occurrences_count"] = redacted_occurrences_count
 
     return FileUniverseResult(

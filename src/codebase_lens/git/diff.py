@@ -316,3 +316,45 @@ def collect_changed_files(
         counts=_counts(changed),
         warnings=tuple(warnings),
     )
+
+
+def collect_diff_between_refs(
+    repo_root: str | Path,
+    *,
+    from_ref: str,
+    to_ref: str = "HEAD",
+) -> ChangedFileSet:
+    """Return changed-file records for an explicit Git ref range."""
+
+    root = Path(repo_root).resolve()
+    if not _is_git_repo(root):
+        return ChangedFileSet(repo_root=root, changed_files=(), counts=_counts(()), warnings=("Git range diff analysis requires a Git work tree.",))
+    if not from_ref.strip():
+        return ChangedFileSet(repo_root=root, changed_files=(), counts=_counts(()), warnings=("Git range diff requires a non-empty from_ref.",))
+    to_ref = to_ref.strip() or "HEAD"
+    files = _collect_diff_origin(root, origin=f"range:{from_ref}..{to_ref}", diff_prefix=["diff", from_ref, to_ref])
+    changed = _merge_changed_files(files)
+    return ChangedFileSet(repo_root=root, changed_files=changed, counts=_counts(changed), warnings=())
+
+
+def collect_diff_patch(
+    repo_root: str | Path,
+    *,
+    from_ref: str,
+    to_ref: str = "HEAD",
+    unified: int = 3,
+) -> tuple[str, tuple[str, ...]]:
+    """Return raw ``git diff`` patch text for an explicit ref range."""
+
+    root = Path(repo_root).resolve()
+    to_ref = to_ref.strip() or "HEAD"
+    unified = max(0, int(unified))
+    if not _is_git_repo(root):
+        return "", ("Git range diff patch requires a Git work tree.",)
+    result = _run_git(root, ["diff", f"--unified={unified}", "--find-renames", from_ref, to_ref, "--"])
+    if result is None:
+        return "", ("Git executable is unavailable.",)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "git diff failed").strip()
+        return "", (detail,)
+    return result.stdout, ()

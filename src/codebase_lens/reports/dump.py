@@ -1,0 +1,227 @@
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+
+from codebase_lens.analyzers.docstrings import collect_module_docstrings, module_docstring_payload
+from codebase_lens.analyzers.python_ast import collect_python_symbols, flatten_symbol_results
+from codebase_lens.core.hashing import sha256_file
+from codebase_lens.core.paths import resolve_user_path, to_posix_relative
+from codebase_lens.core.redaction import redact_text
+from codebase_lens.core.textio import read_text_with_policy
+from codebase_lens.reports.json import symbol_records_payload, write_json_report
+from codebase_lens.reports.manifest import OutputLayout
+from codebase_lens.scanners.universe import discover_file_universe
+
+
+SOURCE_EXTENSIONS = frozenset({".py", ".pyi", ".pyw", ".toml", ".yaml", ".yml", ".ini", ".cfg", ".md", ".rst", ".ps1", ".psm1", ".bat", ".cmd", ".sh", ".js", ".jsx", ".ts", ".tsx", ".css", ".scss", ".html"})
+CONFIG_FILENAMES = frozenset({"pyproject.toml", "setup.cfg", "tox.ini", "pytest.ini", "mypy.ini", "ruff.toml", ".gitignore", ".dockerignore", "requirements.txt", "requirements-dev.txt", "setup.py", "package.json", "tsconfig.json", "jsconfig.json", "biome.json", ".eslintrc.json", ".prettierrc.json"})
+JSON_CONFIG_FILENAMES = frozenset({"package.json", "tsconfig.json", "jsconfig.json", "biome.json", ".eslintrc.json", ".prettierrc.json"})
+DUMP_ARTIFACT_NAMES = frozenset({"codebase_dump.md", "codebase_dump.txt", "codebase_dump_index.json", "diff_dump.md", "diff_dump.txt", "diff_dump_index.json"})
+
+
+@dataclass(frozen=True)
+class DumpBundleResult:
+    outputs: dict[str, str]
+    counts: dict[str, int]
+    warnings: tuple[str, ...]
+    file_universe: dict[str, Any]
+    redaction: dict[str, Any]
+
+
+def _is_test_path(path: str) -> bool:
+    normalized = path.replace("\\", "/")
+    return normalized.startswith("tests/") or "/tests/" in f"/{normalized}/" or Path(normalized).name.startswith("test_")
+
+
+def _is_doc_path(path: str) -> bool:
+    return Path(path).suffix.lower() in {".md", ".rst"}
+
+
+def _is_config_path(path: str) -> bool:
+    p = Path(path)
+    return p.name in CONFIG_FILENAMES or p.suffix.lower() in {".toml", ".yaml", ".yml", ".ini", ".cfg"}
+
+
+def _is_dump_artifact(path: str) -> bool:
+    name = Path(path).name.lower()
+    normalized = path.replace("\\", "/").lower()
+    return name in DUMP_ARTIFACT_NAMES or "codebase_dump" in name or "cbl_dump" in name or normalized.startswith(".codecontext/")
+
+
+def _source_like(path: str, *, include_json: bool) -> bool:
+    p = Path(path)
+    suffix = p.suffix.lower()
+    name = p.name
+    if name in CONFIG_FILENAMES:
+        return include_json or suffix != ".json" or name in JSON_CONFIG_FILENAMES
+    if suffix == ".json":
+        return bool(include_json and name in JSON_CONFIG_FILENAMES)
+    return suffix in SOURCE_EXTENSIONS
+
+
+def _language(path: str) -> str:
+    suffix = Path(path).suffix.lower().strip(".")
+    if suffix in {"py", "pyi", "pyw"}:
+        return "python"
+    if suffix in {"md", "rst"}:
+        return suffix
+    return suffix or "text"
+
+
+def _tree(paths: list[str]) -> str:
+    rendered: list[str] = []
+    seen: set[str] = set()
+    for path in sorted(paths):
+        parts = path.split("/")
+        for index, part in enumerate(parts):
+            marker_path = "/".join(parts[: index + 1])
+            if marker_path in seen:
+                continue
+            seen.add(marker_path)
+            prefix = "  " * index
+            marker = "└─ " if index == len(parts) - 1 else "├─ "
+            rendered.append(f"{prefix}{marker}{part}")
+    return "\n".join(rendered)
+
+
+def _numbered(text: str) -> str:
+    lines = text.splitlines()
+    if not lines:
+        return "0001: "
+    width = max(4, len(str(len(lines))))
+    return "\n".join(f"{index:0{width}d}: {line}" for index, line in enumerate(lines, start=1))
+
+
+def _filter_records(records: tuple[Any, ...], *, tracked_only: bool, include_untracked: bool, include_tests: bool, include_docs: bool, include_config: bool, include_json: bool) -> tuple[list[Any], list[dict[str, Any]]]:
+    selected: list[Any] = []
+    omitted: list[dict[str, Any]] = []
+    for record in records:
+        path = str(getattr(record, "path", ""))
+        git_status = str(getattr(record, "git_status", "") or "")
+        reason: str | None = None
+        if _is_dump_artifact(path):
+            reason = "generated_dump_artifact"
+        elif tracked_only and git_status == "untracked" and not include_untracked:
+            reason = "untracked_not_requested"
+        elif not include_tests and _is_test_path(path):
+            reason = "tests_excluded"
+        elif not include_docs and _is_doc_path(path):
+            reason = "docs_excluded"
+        elif not include_config and _is_config_path(path):
+            reason = "config_excluded"
+        elif not _source_like(path, include_json=include_json):
+            reason = "not_source_like_for_dump"
+        if reason:
+            omitted.append({"path": path, "reason": reason, "size_bytes": getattr(record, "size_bytes", None), "category": "dump_filter"})
+        else:
+            selected.append(record)
+    return selected, sorted(omitted, key=lambda item: str(item.get("path")))
+
+
+def _render_symbol_index(symbols: tuple[Any, ...]) -> list[str]:
+    lines: list[str] = []
+    by_path: dict[str, list[Any]] = {}
+    for symbol in symbols:
+        by_path.setdefault(symbol.path, []).append(symbol)
+    for path in sorted(by_path):
+        lines.extend([f"### `{path}`", ""])
+        for symbol in sorted(by_path[path], key=lambda item: (item.start_line, item.qualified_name)):
+            evidence = f"{symbol.path}:L{symbol.start_line}-L{symbol.end_line}"
+            lines.append(f"- SYMBOL: `{symbol.qualified_name}` — `{symbol.kind}` — `{evidence}`")
+            if symbol.signature:
+                lines.append(f"  - Signature: `{symbol.signature}`")
+            if symbol.docstring_summary:
+                lines.append(f"  - Docstring: {symbol.docstring_summary}")
+        lines.append("")
+    return lines or ["No Python symbols were detected.", ""]
+
+
+def _render_docstring_index(module_payload: dict[str, Any]) -> list[str]:
+    records = module_payload.get("module_docstrings", [])
+    lines: list[str] = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        summary = record.get("summary")
+        path = record.get("path")
+        if not path or not summary:
+            continue
+        start = record.get("start_line") or "?"
+        end = record.get("end_line") or start
+        lines.extend([f"### `{path}`", "", f"- Evidence: `{path}:L{start}-L{end}`", f"- Summary: {summary}", ""])
+    return lines or ["No module docstrings were detected.", ""]
+
+
+def _render_source_file(repo_root: Path, path: str, *, line_numbers: bool, max_file_bytes: int) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    target = repo_root / path
+    read_result = read_text_with_policy(target, max_file_bytes=max_file_bytes)
+    if read_result.skipped_reason:
+        raise ValueError(f"Selected dump file was unexpectedly skipped: {path}: {read_result.skipped_reason}")
+    raw = read_result.text or ""
+    redacted = redact_text(raw)
+    body = _numbered(redacted.text) if line_numbers else redacted.text.rstrip("\n")
+    language = _language(path)
+    rendered = "\n".join([f"### FILE: `{path}`", "", f"Language: `{language}`", f"Lines: {len(raw.splitlines())}", f"SHA256: `{sha256_file(target)}`", "", f"~~~~{language}", body, "~~~~", ""])
+    file_payload = {"path": path, "language": language, "size_bytes": read_result.size_bytes, "line_count": len(raw.splitlines()), "sha256": sha256_file(target), "redacted": bool(redacted.stats.redacted_occurrences_count)}
+    redaction_payload = {"occurrences": redacted.stats.redacted_occurrences_count, "patterns_hit": list(redacted.stats.patterns_hit)}
+    return rendered, file_payload, redaction_payload
+
+
+def write_codebase_dump(layout: OutputLayout, repo_root: str | Path, *, max_file_bytes: int, tracked_only: bool = True, include_untracked: bool = False, include_tests: bool = True, include_docs: bool = True, include_config: bool = True, include_json: bool = False, out_file: str | None = None, output_format: str = "markdown", line_numbers: bool = True, max_total_bytes: int = 0) -> DumpBundleResult:
+    root = Path(repo_root).resolve()
+    universe = discover_file_universe(root, max_file_bytes=max_file_bytes)
+    selected, dump_omissions = _filter_records(universe.included_files, tracked_only=tracked_only, include_untracked=include_untracked, include_tests=include_tests, include_docs=include_docs, include_config=include_config, include_json=include_json)
+    selected_paths = [record.path for record in selected]
+    source_bytes = sum(int(getattr(record, "size_bytes", 0) or 0) for record in selected)
+    if max_total_bytes and source_bytes > max_total_bytes:
+        raise ValueError(f"Dump would emit {source_bytes} source bytes, exceeding --max-total-bytes={max_total_bytes}. Narrow selection or raise the cap.")
+    python_files = [path for path in selected_paths if Path(path).suffix.lower() in {".py", ".pyw", ".pyi"}]
+    symbol_results = collect_python_symbols(root, python_files)
+    symbols = flatten_symbol_results(symbol_results)
+    symbol_payload = symbol_records_payload(symbols, syntax_errors=[])
+    module_docstrings = collect_module_docstrings(root, python_files)
+    module_payload = module_docstring_payload(module_docstrings)
+    lines: list[str] = ["# CBL Codebase Dump", "", f"Repository: `{root.name}`", f"Format: `{output_format}`", f"Tracked only: `{str(tracked_only).lower()}`", f"Include untracked: `{str(include_untracked).lower()}`", f"Line numbers: `{str(line_numbers).lower()}`", "Source truncation: `disabled for included files`", "Safety: hard exclusions and redaction enabled", "", "## Counts", "", f"- Included source files: {len(selected_paths)}", f"- Python files analyzed: {len(python_files)}", f"- Symbols indexed: {len(symbols)}", f"- Source bytes emitted: {source_bytes}", f"- Dump-filter omissions: {len(dump_omissions)}", f"- Scanner omissions: {len(universe.omitted_files)}", "", "## File Tree", "", "~~~~text", _tree(selected_paths) or "<empty>", "~~~~", "", "## Module Docstring Index", "", *_render_docstring_index(module_payload), "## Symbol Index", "", *_render_symbol_index(symbols), "## Omitted Files", ""]
+    all_omissions: list[dict[str, Any]] = [*dump_omissions]
+    for item in universe.omitted_files:
+        all_omissions.append(asdict(item))
+    if all_omissions:
+        lines.extend(["| Path | Reason | Category | Size |", "|---|---|---:|---:|"])
+        for item in sorted(all_omissions, key=lambda value: str(value.get("path"))):
+            lines.append(f"| `{item.get('path', '')}` | `{item.get('reason', '')}` | `{item.get('category', '')}` | {item.get('size_bytes', '') or ''} |")
+    else:
+        lines.append("No files were omitted.")
+    lines.extend(["", "## Source Files", ""])
+    files_payload: list[dict[str, Any]] = []
+    redacted_files = 0
+    redacted_occurrences = 0
+    patterns_hit: set[str] = set()
+    warnings: list[str] = list(universe.warnings)
+    for path in selected_paths:
+        rendered, file_payload, redaction_payload = _render_source_file(root, path, line_numbers=line_numbers, max_file_bytes=max_file_bytes)
+        lines.append(rendered.rstrip("\n"))
+        lines.append("")
+        files_payload.append(file_payload)
+        occurrences = int(redaction_payload.get("occurrences", 0) or 0)
+        if occurrences:
+            redacted_files += 1
+            redacted_occurrences += occurrences
+            patterns_hit.update(str(item) for item in redaction_payload.get("patterns_hit", []))
+    dump_text = "\n".join(lines).rstrip() + "\n"
+    dump_name = "codebase_dump.md" if output_format == "markdown" else "codebase_dump.txt"
+    (layout.latest_dir / dump_name).write_text(dump_text, encoding="utf-8", newline="\n")
+    index_payload = {"schema": {"name": "cbl.codebase_dump", "version": 1}, "mode": "tracked_source_dump", "line_numbers": line_numbers, "source_truncation": "disabled_for_included_files", "files": files_payload, "module_docstrings": module_payload, "symbols": symbol_payload, "omitted_files": all_omissions, "counts": {"included_files": len(selected_paths), "python_files_analyzed": len(python_files), "symbols": len(symbols), "source_bytes": source_bytes, "dump_filter_omissions": len(dump_omissions), "scanner_omissions": len(universe.omitted_files)}, "warnings": warnings}
+    write_json_report(layout.latest_dir / "codebase_dump_index.json", index_payload)
+    outputs = {"codebase_dump_md": f".codecontext/latest/{dump_name}", "codebase_dump_index_json": ".codecontext/latest/codebase_dump_index.json"}
+    if out_file:
+        target = resolve_user_path(root, out_file, allow_absolute=False, allow_hard_excluded=False)
+        rel = to_posix_relative(root, target)
+        if _is_dump_artifact(rel):
+            raise ValueError("--out-file may not target an existing or recursive dump artifact name.")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(dump_text, encoding="utf-8", newline="\n")
+        outputs["codebase_dump_copy"] = rel
+    redaction = {"enabled": True, "redacted_files_count": redacted_files + universe.counts.get("redacted_file_count", 0), "redacted_occurrences_count": redacted_occurrences + universe.redaction.redacted_occurrences_count, "patterns_hit": sorted(set(patterns_hit) | set(universe.redaction.patterns_hit))}
+    return DumpBundleResult(outputs=outputs, counts=dict(index_payload["counts"]), warnings=tuple(warnings), file_universe=universe.manifest_counts(), redaction=redaction)

@@ -106,6 +106,10 @@ def builtin_cbl_contract() -> dict[str, Any]:
             "scripts/dev/audits/audit_phase26_v01_release_closure.py",
             "scripts/dev/audits/audit_phase27_reliability_corrections.py",
             "scripts/dev/audits/audit_phase28_manifest_consistency.py",
+            "scripts/dev/audits/audit_phase29_dump_diffdump.py",
+            "src/codebase_lens/reports/diffdump.py",
+            "src/codebase_lens/reports/dump.py",
+            "src/codebase_lens/analyzers/docstrings.py",
 ],
         "required_symbols": [
             {
@@ -118,6 +122,8 @@ def builtin_cbl_contract() -> dict[str, Any]:
                     "_run_pack",
                     "_run_clean",
                     "_run_graph",
+                    "_run_diffdump",
+                    "_run_dump",
                     "_run_tree",
                     "_run_file",
                     "_run_symbols",
@@ -271,6 +277,27 @@ def builtin_cbl_contract() -> dict[str, Any]:
                     "run_manifest_consistency_audit",
                     "main",
                 ],
+            },
+
+            {
+                "path": "src/codebase_lens/analyzers/docstrings.py",
+                "symbols": ["ModuleDocstringRecord", "ModuleDocstringResult", "collect_module_docstrings", "module_docstring_payload"],
+            },
+            {
+                "path": "src/codebase_lens/reports/dump.py",
+                "symbols": ["DumpBundleResult", "write_codebase_dump"],
+            },
+            {
+                "path": "src/codebase_lens/reports/diffdump.py",
+                "symbols": ["render_diff_dump_markdown", "write_diffdump_reports"],
+            },
+            {
+                "path": "src/codebase_lens/git/diff.py",
+                "symbols": ["collect_diff_between_refs", "collect_diff_patch"],
+            },
+            {
+                "path": "scripts/dev/audits/audit_phase29_dump_diffdump.py",
+                "symbols": ["DumpDiffdumpIssue", "DumpDiffdumpResult", "run_dump_diffdump_audit", "main"],
             },
 ],
         "forbidden_imports": [

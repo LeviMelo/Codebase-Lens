@@ -41,7 +41,7 @@ from codebase_lens.core.errors import CblError, PathSafetyError, RootDetectionEr
 from codebase_lens.core.paths import detect_repository_root, display_path, gitignore_mentions_codecontext, resolve_user_path, to_posix_relative
 from codebase_lens.core.redaction import redact_console_text
 from codebase_lens.core.result import CblCommandResult, emit_result
-from codebase_lens.git.diff import collect_changed_files
+from codebase_lens.git.diff import collect_changed_files, collect_diff_between_refs, collect_diff_patch
 from codebase_lens.git.discover import collect_git_info
 from codebase_lens.reports.json import (
     caller_records_payload,
@@ -62,6 +62,8 @@ from codebase_lens.reports.scanner_outputs import write_file_inventory, write_tr
 from codebase_lens.scanners.universe import discover_file_universe
 from codebase_lens.reports.contract import write_contract_audit_reports
 from codebase_lens.reports.diff import write_diff_reports
+from codebase_lens.reports.diffdump import write_diffdump_reports
+from codebase_lens.reports.dump import write_codebase_dump
 
 
 def _add_global_options(parser: argparse.ArgumentParser) -> None:
@@ -97,6 +99,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor = sub.add_parser("doctor", parents=[parent], help="Validate local tool and repository readiness.")
     doctor.set_defaults(handler=_run_doctor)
+
+    dump = sub.add_parser("dump", parents=[parent], help="Write a search-optimized Markdown source corpus dump.")
+    dump.add_argument("--tracked-only", action="store_true", default=True, help="Include safe Git-tracked source files only. This is the default.")
+    dump.add_argument("--include-untracked", action="store_true", help="Also include safe untracked, non-ignored source files.")
+    dump.add_argument("--out-file", help="Optional repository-relative copy of the dump Markdown file.")
+    dump.add_argument("--output-format", choices=("markdown", "text"), default="markdown", help="Output syntax. Markdown is the default and recommended format.")
+    dump.add_argument("--include-json", action="store_true", help="Include selected source-adjacent JSON config files.")
+    dump.add_argument("--exclude-tests", action="store_true", help="Exclude test files from the source dump.")
+    dump.add_argument("--exclude-docs", action="store_true", help="Exclude Markdown/reStructuredText documentation files from the source dump.")
+    dump.add_argument("--exclude-config", action="store_true", help="Exclude project configuration files from the source dump.")
+    dump.add_argument("--max-total-bytes", type=int, default=0, help="Fail if included source bytes exceed this value. Zero disables the total cap.")
+    dump.add_argument("--no-line-numbers", action="store_true", help="Render raw source blocks without line-number prefixes.")
+    dump.set_defaults(handler=_run_dump)
 
     snapshot = sub.add_parser("snapshot", parents=[parent], help="Write repository snapshot reports.")
     snapshot.add_argument("--changed", action="store_true")
@@ -145,6 +160,14 @@ def build_parser() -> argparse.ArgumentParser:
     diff.add_argument("--symbols", action="store_true")
     diff.add_argument("--stat", action="store_true")
     diff.set_defaults(handler=_run_diff)
+
+    diffdump = sub.add_parser("diffdump", parents=[parent], help="Write a searchable full Git range diff dump.")
+    diffdump.add_argument("--from", dest="from_ref", required=True, help="Old Git ref, commit, branch, or tag.")
+    diffdump.add_argument("--to", dest="to_ref", default="HEAD", help="New Git ref, commit, branch, or tag. Defaults to HEAD.")
+    diffdump.add_argument("--symbols", action="store_true", help="Map changed hunks onto Python symbols.")
+    diffdump.add_argument("--unified", type=int, default=3, help="Unified context lines for the rendered patch.")
+    diffdump.add_argument("--out-file", help="Optional repository-relative copy of the diff dump Markdown file.")
+    diffdump.set_defaults(handler=_run_diffdump)
 
     changed = sub.add_parser("changed", parents=[parent], help="Summarize changed files and changed symbols.")
     changed.add_argument("--staged", action="store_true")
@@ -327,6 +350,40 @@ def _run_doctor(args: argparse.Namespace) -> int:
 
     return 0
 
+
+
+def _run_dump(args: argparse.Namespace) -> int:
+    try:
+        root_info = _detect_root(args)
+        repo_root = root_info.root
+        layout = prepare_output_layout(repo_root, args.out, archive=not args.no_archive)
+        result = write_codebase_dump(layout, repo_root, max_file_bytes=args.max_file_bytes, tracked_only=args.tracked_only, include_untracked=args.include_untracked, include_tests=not args.exclude_tests, include_docs=not args.exclude_docs, include_config=not args.exclude_config, include_json=args.include_json, out_file=args.out_file, output_format=args.output_format, line_numbers=not args.no_line_numbers, max_total_bytes=args.max_total_bytes)
+        outputs = {"manifest_json": ".codecontext/latest/manifest.json", **result.outputs}
+        manifest = build_manifest(**_base_manifest_args(args, repo_root, "dump", outputs, file_universe=result.file_universe, redaction=result.redaction))
+        manifest_path = write_manifest_bundle(layout, manifest)
+        copy_latest_to_run(layout)
+    except RootDetectionError as exc:
+        print(redact_console_text(f"ERROR: {exc}")); return EXIT_ROOT_DETECTION_FAILURE
+    except PathSafetyError as exc:
+        print(redact_console_text(f"ERROR: {exc}")); return EXIT_PATH_SAFETY_VIOLATION
+    except ValueError as exc:
+        print(redact_console_text(f"ERROR: {exc}")); return EXIT_INVALID_ARGUMENTS
+    except OSError as exc:
+        print(redact_console_text(f"ERROR: Could not write codebase dump: {exc}")); return EXIT_OUTPUT_WRITE_FAILURE
+    except CblError as exc:
+        print(redact_console_text(f"ERROR: {exc}")); return EXIT_GENERAL_ERROR
+    if not args.quiet:
+        print("CBL dump: OK")
+        print(f"Included source files: {result.counts.get('included_files', 0)}")
+        print(f"Python files analyzed: {result.counts.get('python_files_analyzed', 0)}")
+        print(f"Symbols indexed: {result.counts.get('symbols', 0)}")
+        print(f"Source bytes emitted: {result.counts.get('source_bytes', 0)}")
+        print("Codebase dump: .codecontext/latest/codebase_dump.md")
+        print("Dump index: .codecontext/latest/codebase_dump_index.json")
+        print(f"Output manifest: {display_path(repo_root, manifest_path, absolute=args.absolute_paths)}")
+        for warning in result.warnings:
+            print(f"WARNING: {redact_console_text(warning)}")
+    return 0
 
 def _run_tree(args: argparse.Namespace) -> int:
     try:
@@ -1318,6 +1375,45 @@ def _run_diff(args: argparse.Namespace) -> int:
 
     return 0
 
+
+
+def _run_diffdump(args: argparse.Namespace) -> int:
+    try:
+        root_info = _detect_root(args)
+        repo_root = root_info.root
+        diff_result = collect_diff_between_refs(repo_root, from_ref=args.from_ref, to_ref=args.to_ref)
+        patch_text, patch_warnings = collect_diff_patch(repo_root, from_ref=args.from_ref, to_ref=args.to_ref, unified=args.unified)
+        changed_symbols_payload = None
+        if args.symbols:
+            symbol_result = map_changed_symbols(repo_root, diff_result.changed_files)
+            changed_symbols_payload = changed_symbol_result_payload(symbol_result)
+        layout = prepare_output_layout(repo_root, args.out, archive=not args.no_archive)
+        outputs = {"manifest_json": ".codecontext/latest/manifest.json", **write_diffdump_reports(layout, repo_root, diff_result, patch_text, from_ref=args.from_ref, to_ref=args.to_ref, unified=args.unified, changed_symbols_payload=changed_symbols_payload, patch_warnings=patch_warnings, out_file=args.out_file)}
+        manifest = build_manifest(**_base_manifest_args(args, repo_root, "diffdump", outputs))
+        manifest_path = write_manifest_bundle(layout, manifest)
+        copy_latest_to_run(layout)
+    except RootDetectionError as exc:
+        print(redact_console_text(f"ERROR: {exc}")); return EXIT_ROOT_DETECTION_FAILURE
+    except PathSafetyError as exc:
+        print(redact_console_text(f"ERROR: {exc}")); return EXIT_PATH_SAFETY_VIOLATION
+    except ValueError as exc:
+        print(redact_console_text(f"ERROR: {exc}")); return EXIT_INVALID_ARGUMENTS
+    except OSError as exc:
+        print(redact_console_text(f"ERROR: Could not write diff dump: {exc}")); return EXIT_OUTPUT_WRITE_FAILURE
+    except CblError as exc:
+        print(redact_console_text(f"ERROR: {exc}")); return EXIT_GENERAL_ERROR
+    if not args.quiet:
+        print("CBL diffdump: OK")
+        print(f"From: {args.from_ref}")
+        print(f"To: {args.to_ref}")
+        print(f"Changed files: {diff_result.counts.get('changed_files_count', 0)}")
+        print(f"Hunks: {diff_result.counts.get('hunk_count', 0)}")
+        print("Diff dump: .codecontext/latest/diff_dump.md")
+        print("Diff dump index: .codecontext/latest/diff_dump_index.json")
+        print(f"Output manifest: {display_path(repo_root, manifest_path, absolute=args.absolute_paths)}")
+        for warning in [*diff_result.warnings, *patch_warnings]:
+            print(f"WARNING: {redact_console_text(warning)}")
+    return 0
 
 def _run_changed(args: argparse.Namespace) -> int:
     try:
