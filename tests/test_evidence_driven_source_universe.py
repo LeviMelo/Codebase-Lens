@@ -60,7 +60,8 @@ def test_file_universe_is_evidence_driven_not_directory_name_driven(tmp_path: Pa
     assert "config/registries/sidra_table_seed.jsonl" in paths
     assert "tests/fixtures/sidra_flat_fixture.json" in paths
     assert "tests/fixtures/small.csv" in paths
-    assert "data/small_tracked_fixture.csv" in paths
+    assert "data/small_tracked_fixture.csv" not in paths
+    assert omitted["data/small_tracked_fixture.csv"] == "hard_excluded"
     assert ".env.example" in paths
 
     assert ".env" not in paths
@@ -103,7 +104,6 @@ def test_dump_uses_scanner_text_universe_without_second_extension_gate(tmp_path:
         "config/registries/sidra_table_seed.jsonl",
         "tests/fixtures/sidra_flat_fixture.json",
         "tests/fixtures/small.csv",
-        "data/small_tracked_fixture.csv",
         ".env.example",
     }
     assert expected <= dumped_paths

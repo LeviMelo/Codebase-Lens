@@ -106,13 +106,12 @@ def main() -> int:
             "config/registries/sidra_table_seed.jsonl",
             "tests/fixtures/sidra_flat_fixture.json",
             "tests/fixtures/small.csv",
-            "data/small_tracked_fixture.csv",
             ".env.example",
         }
         missing = sorted(required - paths)
         forbidden = sorted(
             item
-            for item in [".env", ".codecontext/latest/old.md", "model.parquet"]
+            for item in [".env", ".codecontext/latest/old.md", "model.parquet", "data/small_tracked_fixture.csv"]
             if item in paths
         )
         heading_missing = sorted(path for path in required if f"### FILE: `{path}`" not in dump)

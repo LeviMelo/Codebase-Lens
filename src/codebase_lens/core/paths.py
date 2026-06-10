@@ -202,8 +202,6 @@ def _hard_excluded_dir_applies(parts: tuple[str, ...], index: int, normalized: s
 
 
 def is_hard_excluded_relative(relative_posix_path: str) -> bool:
-    """Return true only for non-source infrastructure, secrets, and binary/data artifacts."""
-
     normalized = relative_posix_path.replace("\\", "/").strip("/")
     if not normalized:
         return False
@@ -229,6 +227,27 @@ def is_hard_excluded_relative(relative_posix_path: str) -> bool:
     for pattern in HARD_EXCLUDED_FILE_PATTERNS:
         if fnmatch(name, pattern) or pure.match(pattern):
             return True
+
+    top_level_generated_roots = {
+        ".cache",
+        "cache",
+        "logs",
+        "log",
+        "tmp",
+        "temp",
+        "outputs",
+        "output",
+        "runs",
+        "run",
+        "data",
+        "raw",
+        "processed",
+        "external",
+        "artifacts",
+        ".checkpoints",
+    }
+    if parts[0] in top_level_generated_roots:
+        return True
 
     return False
 

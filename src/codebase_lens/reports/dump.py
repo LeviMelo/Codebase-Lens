@@ -15,36 +15,8 @@ from codebase_lens.reports.manifest import OutputLayout
 from codebase_lens.scanners.universe import discover_file_universe
 
 
-SOURCE_EXTENSIONS = frozenset(
-    {
-        ".py",
-        ".pyi",
-        ".pyw",
-        ".r",
-        ".rmd",
-        ".qmd",
-        ".toml",
-        ".yaml",
-        ".yml",
-        ".ini",
-        ".cfg",
-        ".md",
-        ".rst",
-        ".ps1",
-        ".psm1",
-        ".bat",
-        ".cmd",
-        ".sh",
-        ".sql",
-        ".js",
-        ".jsx",
-        ".ts",
-        ".tsx",
-        ".css",
-        ".scss",
-        ".html",
-    }
-)
+SOURCE_EXTENSIONS = frozenset({".py", ".pyi", ".pyw", ".r", ".R", ".rmd", ".Rmd", ".qmd", ".toml", ".yaml", ".yml", ".ini", ".cfg", ".md", ".rst", ".ps1", ".psm1", ".bat", ".cmd", ".sh", ".sql", ".js", ".jsx", ".ts", ".tsx", ".css", ".scss", ".html"})
+
 CONFIG_FILENAMES = frozenset({"pyproject.toml", "setup.cfg", "tox.ini", "pytest.ini", "mypy.ini", "ruff.toml", ".gitignore", ".dockerignore", "requirements.txt", "requirements-dev.txt", "setup.py", "package.json", "tsconfig.json", "jsconfig.json", "biome.json", ".eslintrc.json", ".prettierrc.json"})
 JSON_CONFIG_FILENAMES = frozenset({"package.json", "tsconfig.json", "jsconfig.json", "biome.json", ".eslintrc.json", ".prettierrc.json"})
 JSON_SOURCE_EXTENSIONS = frozenset({".json", ".jsonl"})
@@ -85,24 +57,27 @@ def _is_dump_artifact(path: str) -> bool:
 
 
 def _source_like(path: str, *, include_json: bool) -> bool:
-    p = Path(path)
-    suffix = p.suffix.lower()
+    normalized = path.replace("\\", "/")
+    p = Path(normalized)
+    suffix = p.suffix
+    lowered = suffix.lower()
     name = p.name
 
+    if normalized.startswith("config/"):
+        return lowered in {".toml", ".yaml", ".yml", ".ini", ".cfg", ".json", ".jsonl", ".txt", ".md", ".rst"}
+
     if name in CONFIG_FILENAMES:
+        if lowered in {".json", ".jsonl"}:
+            return include_json or name in JSON_CONFIG_FILENAMES
         return True
 
-    if _is_config_path(path):
-        return True
-
-    if suffix in SOURCE_EXTENSIONS:
-        return True
-
-    if suffix in JSON_SOURCE_EXTENSIONS:
+    if lowered in {".json", ".jsonl", ".csv", ".tsv"}:
         return bool(include_json)
 
-    return False
+    if suffix == ".R" or path.endswith(".R"):
+        return True
 
+    return lowered in {item.lower() for item in SOURCE_EXTENSIONS}
 
 def _language(path: str) -> str:
     suffix = Path(path).suffix
@@ -216,8 +191,6 @@ def _filter_records(
     include_json: bool = False,
     scope_paths: tuple[str, ...] = (),
 ):
-    """Filter an already materialized text universe for dump presentation."""
-
     selected = []
     omissions: list[dict[str, Any]] = []
     normalized_scopes = tuple(
@@ -233,36 +206,32 @@ def _filter_records(
         return any(normalized == scope or normalized.startswith(scope + "/") for scope in normalized_scopes)
 
     for record in sorted(records, key=lambda item: item.path):
-        path = record.path
+        path = str(getattr(record, "path", ""))
         name = Path(path).name
+        git_status = str(getattr(record, "git_status", "") or "")
+        reason: str | None = None
 
         if name in DUMP_ARTIFACT_NAMES:
-            omissions.append({"path": path, "reason": "dump_artifact", "category": "dump_filter", "size_bytes": getattr(record, "size_bytes", None)})
-            continue
+            reason = "dump_artifact"
+        elif not in_scope(path):
+            reason = "outside_scope"
+        elif tracked_only and git_status == "untracked" and not include_untracked:
+            reason = "untracked_excluded"
+        elif not include_tests and _is_test_path(path):
+            reason = "tests_excluded"
+        elif not include_docs and _is_doc_path(path):
+            reason = "docs_excluded"
+        elif not include_config and _is_config_path(path):
+            reason = "config_excluded"
+        elif not _source_like(path, include_json=include_json):
+            reason = "not_source_like_for_dump"
 
-        if not in_scope(path):
-            omissions.append({"path": path, "reason": "outside_scope", "category": "dump_filter", "size_bytes": getattr(record, "size_bytes", None)})
-            continue
+        if reason:
+            omissions.append({"path": path, "reason": reason, "category": "dump_filter", "size_bytes": getattr(record, "size_bytes", None)})
+        else:
+            selected.append(record)
 
-        if tracked_only and getattr(record, "git_status", None) == "untracked" and not include_untracked:
-            omissions.append({"path": path, "reason": "untracked_excluded", "category": "dump_filter", "size_bytes": getattr(record, "size_bytes", None)})
-            continue
-
-        if not include_tests and _is_test_path(path):
-            omissions.append({"path": path, "reason": "tests_excluded", "category": "dump_filter", "size_bytes": getattr(record, "size_bytes", None)})
-            continue
-
-        if not include_docs and _is_doc_path(path):
-            omissions.append({"path": path, "reason": "docs_excluded", "category": "dump_filter", "size_bytes": getattr(record, "size_bytes", None)})
-            continue
-
-        if not include_config and _is_config_path(path):
-            omissions.append({"path": path, "reason": "config_excluded", "category": "dump_filter", "size_bytes": getattr(record, "size_bytes", None)})
-            continue
-
-        selected.append(record)
-
-    return selected, omissions
+    return selected, sorted(omissions, key=lambda item: str(item.get("path")))
 
 def _render_symbol_index(symbols: tuple[Any, ...]) -> list[str]:
     lines: list[str] = []
