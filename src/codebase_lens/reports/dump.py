@@ -15,9 +15,39 @@ from codebase_lens.reports.manifest import OutputLayout
 from codebase_lens.scanners.universe import discover_file_universe
 
 
-SOURCE_EXTENSIONS = frozenset({".py", ".pyi", ".pyw", ".toml", ".yaml", ".yml", ".ini", ".cfg", ".md", ".rst", ".ps1", ".psm1", ".bat", ".cmd", ".sh", ".js", ".jsx", ".ts", ".tsx", ".css", ".scss", ".html"})
+SOURCE_EXTENSIONS = frozenset(
+    {
+        ".py",
+        ".pyi",
+        ".pyw",
+        ".r",
+        ".rmd",
+        ".qmd",
+        ".toml",
+        ".yaml",
+        ".yml",
+        ".ini",
+        ".cfg",
+        ".md",
+        ".rst",
+        ".ps1",
+        ".psm1",
+        ".bat",
+        ".cmd",
+        ".sh",
+        ".sql",
+        ".js",
+        ".jsx",
+        ".ts",
+        ".tsx",
+        ".css",
+        ".scss",
+        ".html",
+    }
+)
 CONFIG_FILENAMES = frozenset({"pyproject.toml", "setup.cfg", "tox.ini", "pytest.ini", "mypy.ini", "ruff.toml", ".gitignore", ".dockerignore", "requirements.txt", "requirements-dev.txt", "setup.py", "package.json", "tsconfig.json", "jsconfig.json", "biome.json", ".eslintrc.json", ".prettierrc.json"})
 JSON_CONFIG_FILENAMES = frozenset({"package.json", "tsconfig.json", "jsconfig.json", "biome.json", ".eslintrc.json", ".prettierrc.json"})
+JSON_SOURCE_EXTENSIONS = frozenset({".json", ".jsonl"})
 DUMP_ARTIFACT_NAMES = frozenset({"codebase_dump.md", "codebase_dump.txt", "codebase_dump_index.json", "diff_dump.md", "diff_dump.txt", "diff_dump_index.json"})
 
 
@@ -40,9 +70,13 @@ def _is_doc_path(path: str) -> bool:
 
 
 def _is_config_path(path: str) -> bool:
-    p = Path(path)
-    return p.name in CONFIG_FILENAMES or p.suffix.lower() in {".toml", ".yaml", ".yml", ".ini", ".cfg"}
-
+    normalized = path.replace("\\", "/")
+    p = Path(normalized)
+    return (
+        normalized.startswith("config/")
+        or p.name in CONFIG_FILENAMES
+        or p.suffix.lower() in {".toml", ".yaml", ".yml", ".ini", ".cfg", ".json", ".jsonl"}
+    )
 
 def _is_dump_artifact(path: str) -> bool:
     name = Path(path).name.lower()
@@ -54,21 +88,61 @@ def _source_like(path: str, *, include_json: bool) -> bool:
     p = Path(path)
     suffix = p.suffix.lower()
     name = p.name
+
     if name in CONFIG_FILENAMES:
-        return include_json or suffix != ".json" or name in JSON_CONFIG_FILENAMES
-    if suffix == ".json":
-        return bool(include_json and name in JSON_CONFIG_FILENAMES)
-    return suffix in SOURCE_EXTENSIONS
+        return True
+
+    if _is_config_path(path):
+        return True
+
+    if suffix in SOURCE_EXTENSIONS:
+        return True
+
+    if suffix in JSON_SOURCE_EXTENSIONS:
+        return bool(include_json)
+
+    return False
 
 
 def _language(path: str) -> str:
-    suffix = Path(path).suffix.lower().strip(".")
-    if suffix in {"py", "pyi", "pyw"}:
-        return "python"
-    if suffix in {"md", "rst"}:
-        return suffix
-    return suffix or "text"
-
+    suffix = Path(path).suffix
+    lowered = suffix.lower()
+    mapping = {
+        ".py": "python",
+        ".pyw": "python",
+        ".pyi": "python",
+        ".r": "r",
+        ".rmd": "r",
+        ".qmd": "markdown",
+        ".toml": "toml",
+        ".yaml": "yaml",
+        ".yml": "yaml",
+        ".json": "json",
+        ".jsonl": "jsonl",
+        ".md": "markdown",
+        ".rst": "rst",
+        ".txt": "text",
+        ".ini": "ini",
+        ".cfg": "ini",
+        ".ps1": "powershell",
+        ".psm1": "powershell",
+        ".bat": "batch",
+        ".cmd": "batch",
+        ".sh": "bash",
+        ".sql": "sql",
+        ".html": "html",
+        ".css": "css",
+        ".scss": "scss",
+        ".js": "javascript",
+        ".jsx": "javascript",
+        ".ts": "typescript",
+        ".tsx": "typescript",
+        ".csv": "csv",
+        ".tsv": "tsv",
+    }
+    if suffix == ".R" or path.endswith(".R"):
+        return "r"
+    return mapping.get(lowered, "text")
 
 def _tree(paths: list[str]) -> str:
     rendered: list[str] = []
@@ -131,31 +205,64 @@ def _record_in_scope(path: str, scope_paths: tuple[str, ...]) -> bool:
     return False
 
 
-def _filter_records(records: tuple[Any, ...], *, tracked_only: bool, include_untracked: bool, include_tests: bool, include_docs: bool, include_config: bool, include_json: bool) -> tuple[list[Any], list[dict[str, Any]]]:
-    selected: list[Any] = []
-    omitted: list[dict[str, Any]] = []
-    for record in records:
-        path = str(getattr(record, "path", ""))
-        git_status = str(getattr(record, "git_status", "") or "")
-        reason: str | None = None
-        if _is_dump_artifact(path):
-            reason = "generated_dump_artifact"
-        elif tracked_only and git_status == "untracked" and not include_untracked:
-            reason = "untracked_not_requested"
-        elif not include_tests and _is_test_path(path):
-            reason = "tests_excluded"
-        elif not include_docs and _is_doc_path(path):
-            reason = "docs_excluded"
-        elif not include_config and _is_config_path(path):
-            reason = "config_excluded"
-        elif not _source_like(path, include_json=include_json):
-            reason = "not_source_like_for_dump"
-        if reason:
-            omitted.append({"path": path, "reason": reason, "size_bytes": getattr(record, "size_bytes", None), "category": "dump_filter"})
-        else:
-            selected.append(record)
-    return selected, sorted(omitted, key=lambda item: str(item.get("path")))
+def _filter_records(
+    records,
+    *,
+    tracked_only: bool,
+    include_untracked: bool,
+    include_tests: bool,
+    include_docs: bool,
+    include_config: bool,
+    include_json: bool = False,
+    scope_paths: tuple[str, ...] = (),
+):
+    """Filter an already materialized text universe for dump presentation."""
 
+    selected = []
+    omissions: list[dict[str, Any]] = []
+    normalized_scopes = tuple(
+        item.replace("\\", "/").strip("/")
+        for item in scope_paths
+        if str(item).replace("\\", "/").strip("/")
+    )
+
+    def in_scope(path: str) -> bool:
+        if not normalized_scopes:
+            return True
+        normalized = path.replace("\\", "/").strip("/")
+        return any(normalized == scope or normalized.startswith(scope + "/") for scope in normalized_scopes)
+
+    for record in sorted(records, key=lambda item: item.path):
+        path = record.path
+        name = Path(path).name
+
+        if name in DUMP_ARTIFACT_NAMES:
+            omissions.append({"path": path, "reason": "dump_artifact", "category": "dump_filter", "size_bytes": getattr(record, "size_bytes", None)})
+            continue
+
+        if not in_scope(path):
+            omissions.append({"path": path, "reason": "outside_scope", "category": "dump_filter", "size_bytes": getattr(record, "size_bytes", None)})
+            continue
+
+        if tracked_only and getattr(record, "git_status", None) == "untracked" and not include_untracked:
+            omissions.append({"path": path, "reason": "untracked_excluded", "category": "dump_filter", "size_bytes": getattr(record, "size_bytes", None)})
+            continue
+
+        if not include_tests and _is_test_path(path):
+            omissions.append({"path": path, "reason": "tests_excluded", "category": "dump_filter", "size_bytes": getattr(record, "size_bytes", None)})
+            continue
+
+        if not include_docs and _is_doc_path(path):
+            omissions.append({"path": path, "reason": "docs_excluded", "category": "dump_filter", "size_bytes": getattr(record, "size_bytes", None)})
+            continue
+
+        if not include_config and _is_config_path(path):
+            omissions.append({"path": path, "reason": "config_excluded", "category": "dump_filter", "size_bytes": getattr(record, "size_bytes", None)})
+            continue
+
+        selected.append(record)
+
+    return selected, omissions
 
 def _render_symbol_index(symbols: tuple[Any, ...]) -> list[str]:
     lines: list[str] = []

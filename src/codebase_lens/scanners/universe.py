@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,6 +35,7 @@ class FileUniverseResult:
         return {
             "tracked_included_count": self.counts.get("tracked_included_count", 0),
             "untracked_included_count": self.counts.get("untracked_included_count", 0),
+            "filesystem_included_count": self.counts.get("filesystem_included_count", 0),
             "ignored_count": self.counts.get("ignored_count", 0),
             "hard_excluded_ignored_count": self.counts.get("hard_excluded_ignored_count", 0),
             "hard_excluded_count": self.counts.get("hard_excluded_count", 0),
@@ -45,6 +47,62 @@ class FileUniverseResult:
             "included_count": self.counts.get("included_count", 0),
             "omitted_files_count": self.counts.get("omitted_files_count", 0),
         }
+
+
+LANGUAGE_BY_SUFFIX = {
+    ".py": "python",
+    ".pyw": "python",
+    ".pyi": "python",
+    ".r": "r",
+    ".R": "r",
+    ".rmd": "r",
+    ".Rmd": "r",
+    ".qmd": "markdown",
+    ".toml": "toml",
+    ".yaml": "yaml",
+    ".yml": "yaml",
+    ".json": "json",
+    ".jsonl": "jsonl",
+    ".md": "markdown",
+    ".rst": "rst",
+    ".txt": "text",
+    ".ini": "ini",
+    ".cfg": "ini",
+    ".ps1": "powershell",
+    ".psm1": "powershell",
+    ".bat": "batch",
+    ".cmd": "batch",
+    ".sh": "bash",
+    ".sql": "sql",
+    ".html": "html",
+    ".css": "css",
+    ".scss": "scss",
+    ".js": "javascript",
+    ".jsx": "javascript",
+    ".ts": "typescript",
+    ".tsx": "typescript",
+    ".csv": "csv",
+    ".tsv": "tsv",
+}
+
+SOURCE_LIKE_FILENAMES = {
+    ".dockerignore",
+    ".gitignore",
+    ".gitattributes",
+    ".editorconfig",
+    ".env.example",
+    ".env.sample",
+    ".env.template",
+    "Dockerfile",
+    "Containerfile",
+    "Makefile",
+    "makefile",
+    "Rakefile",
+    "Gemfile",
+    "Procfile",
+    "requirements.txt",
+    "requirements-dev.txt",
+}
 
 
 def _split_ignored_counts(ignored_paths: tuple[str, ...]) -> tuple[int, int]:
@@ -62,6 +120,7 @@ def _split_ignored_counts(ignored_paths: tuple[str, ...]) -> tuple[int, int]:
 
     return ordinary, hard_excluded
 
+
 def _empty_counts() -> dict[str, int]:
     return {
         "tracked_candidate_count": 0,
@@ -78,77 +137,55 @@ def _empty_counts() -> dict[str, int]:
         "large_skipped_count": 0,
         "binary_skipped_count": 0,
         "decode_failed_count": 0,
-        "unsupported_extension_count": 0,
         "missing_or_directory_count": 0,
+        "unsupported_extension_count": 0,
         "redacted_file_count": 0,
-        "redacted_occurrences_count": 0,
     }
+
+
+def _language_for(path: Path) -> str:
+    suffix = path.suffix
+    if suffix in LANGUAGE_BY_SUFFIX:
+        return LANGUAGE_BY_SUFFIX[suffix]
+    lowered = suffix.lower()
+    if lowered in LANGUAGE_BY_SUFFIX:
+        return LANGUAGE_BY_SUFFIX[lowered]
+    if path.name in SOURCE_LIKE_FILENAMES:
+        return "text"
+    return "text"
 
 
 def _extension_or_name_is_default_text(path: Path) -> bool:
-    name = path.name
-    suffix = path.suffix.lower()
-    if name in DEFAULT_INCLUDED_TEXT_EXTENSIONS:
-        return True
-    if suffix in DEFAULT_INCLUDED_TEXT_EXTENSIONS:
-        return True
-    if suffix == "":
-        return True
-    return False
-
-
-def _language_for_path(path: Path) -> str | None:
-    suffix = path.suffix.lower()
-    mapping = {
-        ".py": "python",
-        ".pyw": "python",
-        ".pyi": "python",
-        ".toml": "toml",
-        ".yaml": "yaml",
-        ".yml": "yaml",
-        ".json": "json",
-        ".jsonl": "jsonl",
-        ".md": "markdown",
-        ".rst": "rst",
-        ".txt": "text",
-        ".ini": "ini",
-        ".cfg": "cfg",
-        ".ps1": "powershell",
-        ".psm1": "powershell",
-        ".bat": "batch",
-        ".cmd": "batch",
-        ".sh": "shell",
-        ".sql": "sql",
-        ".html": "html",
-        ".css": "css",
-        ".js": "javascript",
-        ".jsx": "javascript",
-        ".ts": "typescript",
-        ".tsx": "typescript",
-    }
-    if path.name == ".gitignore":
-        return "gitignore"
-    if path.name == ".dockerignore":
-        return "dockerignore"
-    return mapping.get(suffix)
+    lowered_allowed = {item.lower() for item in DEFAULT_INCLUDED_TEXT_EXTENSIONS}
+    suffix = path.suffix
+    return (
+        suffix in DEFAULT_INCLUDED_TEXT_EXTENSIONS
+        or suffix.lower() in lowered_allowed
+        or path.name in SOURCE_LIKE_FILENAMES
+    )
 
 
 def _filesystem_candidates(repo_root: Path) -> tuple[tuple[str, str], ...]:
     candidates: list[tuple[str, str]] = []
 
-    for path in sorted(repo_root.rglob("*")):
-        if not path.is_file():
-            continue
-        relative = to_posix_relative(repo_root, path)
+    for current_root, dir_names, file_names in os.walk(repo_root):
+        current = Path(current_root)
+        relative_current = "" if current == repo_root else to_posix_relative(repo_root, current)
 
-        parts = relative.split("/")
-        if any(is_hard_excluded_relative("/".join(parts[: index + 1])) for index in range(len(parts))):
+        kept_dirs: list[str] = []
+        for name in dir_names:
+            candidate = f"{relative_current}/{name}".strip("/")
+            if is_hard_excluded_relative(candidate):
+                continue
+            kept_dirs.append(name)
+        dir_names[:] = kept_dirs
+
+        for name in file_names:
+            path = current / name
+            relative = to_posix_relative(repo_root, path)
             candidates.append((relative, "filesystem"))
-            continue
 
-        candidates.append((relative, "filesystem"))
-
-    return tuple(candidates)
+    return tuple(sorted(set(candidates)))
 
 
 def _git_candidates(repo_root: Path) -> tuple[tuple[str, str], ...]:
@@ -186,6 +223,8 @@ def discover_file_universe(
     include_large: bool = False,
     include_binary: bool = False,
 ) -> FileUniverseResult:
+    """Materialize candidates first, then classify by concrete file facts."""
+
     root = Path(repo_root).resolve()
     git_sets = collect_git_file_sets(root)
     counts = _empty_counts()
@@ -197,7 +236,7 @@ def discover_file_universe(
         counts["tracked_candidate_count"] = len(git_sets.tracked)
         counts["untracked_candidate_count"] = len(git_sets.untracked_nonignored)
     else:
-        counts["filesystem_candidate_count"] = sum(1 for _ in root.rglob("*") if _.is_file())
+        counts["filesystem_candidate_count"] = sum(1 for _ in _filesystem_candidates(root))
 
     warnings: list[str] = []
     if git_sets.warning:
@@ -225,13 +264,8 @@ def discover_file_universe(
             continue
 
         size_bytes = path.stat().st_size
-
-        if not _extension_or_name_is_default_text(path):
-            counts["unsupported_extension_count"] += 1
-            omitted.append(_omit(relative, "unsupported_extension", size_bytes, "unsupported_extension"))
-            continue
-
         read_result = read_text_with_policy(path, max_file_bytes=max_file_bytes)
+
         if read_result.skipped_reason == "large_skipped" and not include_large:
             counts["large_skipped_count"] += 1
             omitted.append(_omit(relative, "large_skipped", size_bytes, "large_skipped"))
@@ -245,6 +279,10 @@ def discover_file_universe(
         if read_result.skipped_reason == "decode_failed":
             counts["decode_failed_count"] += 1
             omitted.append(_omit(relative, "decode_failed", size_bytes, "decode_failed"))
+            continue
+
+        if read_result.skipped_reason:
+            omitted.append(_omit(relative, read_result.skipped_reason, size_bytes, read_result.skipped_reason))
             continue
 
         text = read_result.text or ""
@@ -268,7 +306,7 @@ def discover_file_universe(
             is_large=False,
             is_included=True,
             skip_reason=None,
-            language=_language_for_path(path),
+            language=_language_for(path),
             line_count=line_count,
             redacted=bool(redacted.stats.redacted_occurrences_count),
         )
@@ -281,12 +319,10 @@ def discover_file_universe(
         else:
             counts["filesystem_included_count"] += 1
 
-    included = sorted(included, key=lambda record: record.path)
-    omitted = sorted(omitted, key=lambda record: record.path)
-
+    included = sorted(included, key=lambda item: item.path)
+    omitted = sorted(omitted, key=lambda item: item.path)
     counts["included_count"] = len(included)
     counts["omitted_files_count"] = len(omitted)
-    counts["redacted_occurrences_count"] = redacted_occurrences_count
 
     return FileUniverseResult(
         repo_root=root,

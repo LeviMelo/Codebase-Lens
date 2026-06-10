@@ -6,7 +6,12 @@ from dataclasses import dataclass
 from fnmatch import fnmatch
 from pathlib import Path, PurePosixPath
 
-from .constants import HARD_EXCLUDED_DIR_NAMES, HARD_EXCLUDED_FILE_PATTERNS, STRONG_PROJECT_MARKERS
+from .constants import (
+    CODE_SOURCE_EXTENSIONS,
+    HARD_EXCLUDED_DIR_NAMES,
+    HARD_EXCLUDED_FILE_PATTERNS,
+    STRONG_PROJECT_MARKERS,
+)
 from .errors import PathSafetyError, RootDetectionError
 
 
@@ -134,27 +139,98 @@ def has_windows_drive_prefix(raw_path: str) -> bool:
     return re.match(r"^[A-Za-z]:[\\/]", raw_path) is not None
 
 
+SOURCE_ROOT_DIR_NAMES = frozenset(
+    {
+        "src",
+        "lib",
+        "app",
+        "apps",
+        "packages",
+        "pkg",
+        "tests",
+        "test",
+        "scripts",
+        "script",
+    }
+)
+
+# These directory names are often generated artifacts at repository root,
+# but they are also common legitimate package/module names. A file such as
+# src/pegasus/output/bundle.py is source code and must not be hard-excluded.
+SOURCE_PROTECTED_ARTIFACT_DIR_NAMES = frozenset(
+    {
+        "cache",
+        "data",
+        "external",
+        "log",
+        "logs",
+        "output",
+        "outputs",
+        "processed",
+        "raw",
+        "run",
+        "runs",
+        "temp",
+        "tmp",
+        "artifacts",
+    }
+)
+
+
+def _is_inside_source_tree(parts: tuple[str, ...], index: int) -> bool:
+    return any(part in SOURCE_ROOT_DIR_NAMES for part in parts[:index])
+
+
+def _has_source_code_suffix(normalized: str) -> bool:
+    suffix = PurePosixPath(normalized).suffix.lower()
+    return suffix in CODE_SOURCE_EXTENSIONS
+
+
+def _hard_excluded_dir_applies(parts: tuple[str, ...], index: int, normalized: str) -> bool:
+    part = parts[index]
+    if part not in HARD_EXCLUDED_DIR_NAMES:
+        return False
+
+    if (
+        part in SOURCE_PROTECTED_ARTIFACT_DIR_NAMES
+        and _is_inside_source_tree(parts, index)
+        and _has_source_code_suffix(normalized)
+    ):
+        return False
+
+    return True
+
+
 def is_hard_excluded_relative(relative_posix_path: str) -> bool:
-    normalized = relative_posix_path.strip("/").replace("\\", "/")
+    """Return true only for non-source infrastructure, secrets, and binary/data artifacts."""
+
+    normalized = relative_posix_path.replace("\\", "/").strip("/")
     if not normalized:
         return False
 
     parts = tuple(part for part in normalized.split("/") if part)
-    for part in parts:
-        if part in HARD_EXCLUDED_DIR_NAMES:
-            return True
+    if not parts:
+        return False
+
+    if any(part in HARD_EXCLUDED_DIR_NAMES for part in parts):
+        return True
 
     name = parts[-1]
+    safe_dotenv_examples = {
+        ".env.example",
+        ".env.sample",
+        ".env.template",
+        ".env.defaults",
+    }
+    if name in safe_dotenv_examples:
+        return False
+
     pure = PurePosixPath(normalized)
     for pattern in HARD_EXCLUDED_FILE_PATTERNS:
         if fnmatch(name, pattern) or pure.match(pattern):
             return True
 
-    if ".dvc/cache" in normalized:
-        return True
-
     return False
-
 
 def resolve_user_path(
     repo_root: str | Path,

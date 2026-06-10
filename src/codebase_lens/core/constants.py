@@ -6,6 +6,37 @@ DEFAULT_MAX_EXCERPT_BYTES = 65536
 DEFAULT_MAX_TOTAL_SCAN_BYTES = 50 * 1024 * 1024
 BINARY_SNIFF_BYTES = 8192
 
+# Extensions that represent user-authored source code and must not be
+# discarded merely because they live under a package directory named
+# "output", "data", "cache", or another generic artifact-like name.
+#
+# This is intentionally broader than Python. CBL is a local evidence tool
+# for heterogeneous repositories; R bridge scripts, shell scripts, SQL,
+# frontend code, and typed stubs are source.
+CODE_SOURCE_EXTENSIONS = frozenset(
+    {
+        ".py",
+        ".pyw",
+        ".pyi",
+        ".r",
+        ".rmd",
+        ".qmd",
+        ".ps1",
+        ".psm1",
+        ".bat",
+        ".cmd",
+        ".sh",
+        ".sql",
+        ".js",
+        ".jsx",
+        ".ts",
+        ".tsx",
+        ".css",
+        ".scss",
+        ".html",
+    }
+)
+
 PARTIAL_IMPLEMENTATION_MESSAGE = (
     "PARTIAL IMPLEMENTATION: this command exists but is not complete in the current milestone."
 )
@@ -71,32 +102,15 @@ HARD_EXCLUDED_DIR_NAMES = frozenset(
         ".nox",
         ".ipynb_checkpoints",
         "node_modules",
-        "dist",
-        "build",
         "site-packages",
         ".eggs",
-        ".cache",
-        "cache",
-        "logs",
-        "log",
-        "tmp",
-        "temp",
-        "outputs",
-        "output",
-        "runs",
-        "run",
-        "data",
-        "raw",
-        "processed",
-        "external",
-        "artifacts",
-        ".checkpoints",
     }
 )
 
 HARD_EXCLUDED_FILE_PATTERNS = (
     ".env",
-    ".env.*",
+    ".env.local",
+    ".env.*.local",
     "*.pem",
     "*.key",
     "*.crt",
@@ -160,7 +174,6 @@ HARD_EXCLUDED_FILE_PATTERNS = (
     "*.pt",
     "*.pth",
     "*.ckpt",
-    "*.egg-info",
 )
 
 DEFAULT_INCLUDED_TEXT_EXTENSIONS = frozenset(
@@ -168,6 +181,10 @@ DEFAULT_INCLUDED_TEXT_EXTENSIONS = frozenset(
         ".py",
         ".pyw",
         ".pyi",
+        ".r",
+        ".R",
+        ".Rmd",
+        ".qmd",
         ".toml",
         ".yaml",
         ".yml",
@@ -178,6 +195,7 @@ DEFAULT_INCLUDED_TEXT_EXTENSIONS = frozenset(
         ".txt",
         ".ini",
         ".cfg",
+        ".env.example",
         ".gitignore",
         ".dockerignore",
         ".ps1",
@@ -188,10 +206,61 @@ DEFAULT_INCLUDED_TEXT_EXTENSIONS = frozenset(
         ".sql",
         ".html",
         ".css",
+        ".scss",
         ".js",
         ".jsx",
         ".ts",
         ".tsx",
+        ".vue",
+        ".svelte",
+        ".rs",
+        ".go",
+        ".java",
+        ".kt",
+        ".kts",
+        ".c",
+        ".h",
+        ".cc",
+        ".cpp",
+        ".hpp",
+        ".cs",
+        ".rb",
+        ".php",
+        ".lua",
+        ".jl",
+        ".m",
+        ".mm",
+        ".swift",
+        ".scala",
+        ".clj",
+        ".ex",
+        ".exs",
+        ".erl",
+        ".hrl",
+        ".fs",
+        ".fsx",
+        ".ml",
+        ".mli",
+        ".nim",
+        ".zig",
+        ".hs",
+        ".lhs",
+        ".pl",
+        ".pm",
+        ".awk",
+        ".sed",
+        ".dockerfile",
+        ".make",
+        ".mk",
+        ".cmake",
+        ".jinja",
+        ".j2",
+        ".mustache",
+        ".graphql",
+        ".proto",
+        ".thrift",
+        ".csv",
+        ".tsv",
     }
 )
 
